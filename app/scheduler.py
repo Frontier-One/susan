@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from app.action_items import process_action_items
 from app.config import logger
 from app.standup_digest import process_standup_digest
+from app.status_page import process_status_page
 from app.roadmap import parse_roadmap_command, process_roadmap
 from app.slack_api import _try_slack_open_im_with_user, post_message
 from app.weekly_context import resolve_github_repos_for_weekly_status, weekly_status_include_github
@@ -299,6 +300,17 @@ def parse_schedule_add(
             channel_id=channel_id,
         )
 
+    for status_prefix in ("environment status page", "environment status", "status page", "env status"):
+        if lower_head.startswith(status_prefix):
+            return ParsedScheduleAdd(
+                job_type="status_page",
+                job_params={"command_text": head[len(status_prefix) :].strip()},
+                hour=hour,
+                minute=minute,
+                days_of_week=days,
+                channel_id=channel_id,
+            )
+
     for standup_prefix in ("daily update", "daily summary", "daily status", "daily standup", "standup digest", "daily digest"):
         if lower_head.startswith(standup_prefix):
             return ParsedScheduleAdd(
@@ -348,6 +360,8 @@ def _job_summary(job: dict) -> str:
     elif jt == "roadmap":
         extra = (params.get("command_text") or "").strip() or "(default window)"
         kind = f"roadmap {params.get('kind') or 'status'} ({extra})"
+    elif jt == "status_page":
+        kind = "environment status page"
     else:
         kind = jt
     days = json.loads(job["days_of_week"])
@@ -554,6 +568,10 @@ async def execute_scheduled_job(job: dict) -> None:
             None,
             auto_publish=True,
         )
+        return
+
+    if jt == "status_page":
+        await process_status_page("status page", channel, user, None, None, auto_publish=True)
         return
 
     if jt == "action_items":

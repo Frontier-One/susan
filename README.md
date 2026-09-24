@@ -95,6 +95,7 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 - `/susan create issue …`, `create pr …` (GitHub OAuth + allowlists)
 - `/susan summarize merged prs …` / keywords like `pr summary` — merged PRs over a date range, preview then approve to post to channel
 - `/susan weekly status …` — Structured update (*workstreams* with *1. Last week* / *2. Next steps* and links) from **Slack messages**, **channel bookmarks**, **Google Drive**, and **all `GITHUB_REPOS`** in tech channels. Publishes the full report to a **Slack Canvas** and posts a short link in the channel (needs `canvases:write` + `files:read`; falls back to long channel messages if Canvas is unavailable). Optional `--no-approval` (restrict with `SUSAN_WEEKLY_AUTO_POST_USER_IDS`).
+- `/susan status page …` — The **environment status page**, rebuilt from last night's cloud-infra probe (`environment-status-page` artifact of `env-nightly`), the alert channels and the open roadmap issues. Numbers and bars are computed from the probe's `status.json`; the prose is written by **our own (sovereign-route) model** as strict JSON and HTML-escaped. Susan stores and hosts it at `GET /status/{slug}` (and `/status/latest`) behind `SUSAN_STATUS_PAGE_TOKEN`, and posts the tokened link. Schedule: `/susan schedule add status page every monday at 09:00 in #team-tech`.
 - `/susan daily update …` (alias `daily status`) — The team's daily update: *Major hits · Major blockers and misses · Discussed · Decisions*, merged from the written standups in `#team-tech-standups` (`SUSAN_OFFLINE_STANDUP_CHANNEL`) and the Granola standup meeting, with a Granola link for detail. Scheduled at 16:00 into `#team-tech` it replaces the standup notes.
 - `/susan standups …` — Summarize daily standup notes from `#team-tech` (threads) for a date window
 - `/susan surface failures` / `what's failing` — Digest of failing CI/promote/cost alerts from configured alert channels
@@ -174,6 +175,9 @@ the proposed field values go into the issue body for a human to set.
 | `DEFAULT_EMAIL_TO` | Optional | Fallback when draft has no To: line |
 | `SLACK_USER_EMAIL_MAP` | Optional | `U123:a@b.com,…` or JSON map when Slack hides emails |
 | `SUSAN_WEEKLY_AUTO_POST_USER_IDS` | Optional | Comma Slack user IDs allowed to use `--no-approval` on weekly status |
+| `SUSAN_STATUS_PAGE_TOKEN` | Required for `status page` | Shared secret in the page URL (`?k=…`). Without it the route is a 404 and the command refuses: the page carries codewords and private addresses. |
+| `SUSAN_STATUS_PAGE_LOOKBACK_DAYS` | Optional | Days of alert-channel traffic and roadmap issues fed to the narrative (default 7). |
+| `SUSAN_STATUS_PAGE_MAX_TOKENS` | Optional | Narrative completion budget (default 6000). |
 | `SUSAN_TECH_WEEKLY_CHANNEL_NAMES` | Optional | Channel name slugs (comma) that get GitHub metrics in weekly status; default `team-tech,software,security` |
 
 Tuning knobs (messages, Drive scan depth, Claude retries, etc.) are documented inline in `.env.example`.

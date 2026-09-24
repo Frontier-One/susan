@@ -93,6 +93,7 @@ from app.channel_surface import (
     process_channel_surface,
 )
 from app.standup_digest import parse_daily_standup_command, process_standup_digest
+from app.status_page import parse_status_page_command, process_status_page, status_page_token
 
 from app.sales_prep import parse_sales_prep_command, process_sales_prep
 from app.slack_events import handle_slack_event_callback, parse_events_body
@@ -1044,6 +1045,28 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             }
         )
 
+    if parse_status_page_command(text) is not None:
+        _, status_auto_post = strip_weekly_status_auto_post_flags(text)
+        if status_auto_post and not weekly_status_auto_post_user_allowed(user):
+            return JSONResponse({"response_type": "ephemeral", "text": (
+                "Auto-publish (`--no-approval`) is restricted for your user. Remove the flag for a private "
+                "preview, or ask an admin to add your Slack user id to `SUSAN_WEEKLY_AUTO_POST_USER_IDS`.")})
+
+        async def run_status_page():
+            try:
+                await process_status_page(text, channel, user, thread_ts, response_url)
+            except Exception as e:
+                logger.exception("Status page task failed")
+                try:
+                    await notify_user_ephemeral(channel, user, f"Susan error (status page): {e}", None, response_url)
+                except Exception as e2:
+                    logger.error("Could not notify user after status page error: %s", e2)
+
+        background_tasks.add_task(run_status_page)
+        return JSONResponse({"response_type": "ephemeral", "text": (
+            "Building the environment status page from last night's probe, the alert channels and the "
+            "roadmap — our own model writes the prose. You'll get a private preview with the link.")})
+
     # Before parse_standup_command: "standup digest" also matches its bare "standup" prefix.
     if parse_daily_standup_command(text) is not None:
         _, standup_auto_post = strip_weekly_status_auto_post_flags(text)
@@ -1474,6 +1497,25 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "susan"}
+
+
+@app.get("/status/{slug}", response_class=HTMLResponse)
+async def status_page(slug: str, k: str = ""):
+    """Susan-hosted pages (the environment status). Token-gated: the page carries
+    codewords and private addresses. `latest` resolves to the newest env-status page.
+    Wrong or missing token, or no token configured server-side, is a plain 404 — the
+    URL must not confirm that a page exists."""
+    import secrets as _secrets
+
+    from db import get_published_page, latest_published_page
+
+    expected = status_page_token()
+    if not expected or not k or not _secrets.compare_digest(k.encode(), expected.encode()):
+        raise HTTPException(status_code=404)
+    page = await latest_published_page("env-status") if slug == "latest" else await get_published_page(slug)
+    if page is None:
+        raise HTTPException(status_code=404)
+    return HTMLResponse(page["html"], headers={"Cache-Control": "private, no-store", "X-Robots-Tag": "noindex"})
 
 
 @app.post("/susan/events")
