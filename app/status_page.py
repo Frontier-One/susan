@@ -49,7 +49,18 @@ STATUS_WORKFLOW_FILE = "env-nightly.yml"
 STATUS_ARTIFACT_NAME = "environment-status-page"
 PAGE_KIND = "env-status"
 
-_STATUS_PREFIXES = ("environment status page", "environment status", "status page", "env status")
+# "status" ALONE stays the weekly status (an older, separate command) — these are the
+# phrasings that unambiguously mean this page. Longest first so a longer phrase is not
+# eaten by a shorter one it contains.
+_STATUS_PREFIXES = (
+    "environment status page",
+    "environment status",
+    "platform status",
+    "estate status",
+    "infra status",
+    "status page",
+    "env status",
+)
 
 
 def parse_status_page_command(text: str) -> str | None:
