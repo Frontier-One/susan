@@ -340,6 +340,20 @@ class ActionItemChannelTab(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class PublishedPage(Base):
+    """An HTML page Susan rendered and hosts (GET /status/{slug}); e.g. the environment status."""
+
+    __tablename__ = "published_pages"
+
+    slug: Mapped[str] = mapped_column(String(120), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    html: Mapped[str] = mapped_column(Text, nullable=False)
+    model_route: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class ScheduledJob(Base):
     """Recurring job configured via `/susan schedule` in Slack."""
 
@@ -1109,3 +1123,43 @@ async def update_scheduled_job_after_run(
         row.next_run_at = next_run_at
         row.last_error = last_error
         await session.commit()
+
+
+# ── Published pages (Susan-hosted HTML, e.g. the environment status page) ──────────────
+
+
+async def upsert_published_page(
+    slug: str, kind: str, title: str, html: str,
+    *, model_route: str | None = None, model_name: str | None = None,
+) -> None:
+    async with async_session() as session:
+        row = await session.get(PublishedPage, slug)
+        now = datetime.now(timezone.utc)
+        if row is None:
+            session.add(PublishedPage(slug=slug, kind=kind, title=title, html=html,
+                                      model_route=model_route, model_name=model_name, created_at=now))
+        else:
+            row.kind, row.title, row.html = kind, title, html
+            row.model_route, row.model_name, row.created_at = model_route, model_name, now
+        await session.commit()
+
+
+async def get_published_page(slug: str) -> dict | None:
+    async with async_session() as session:
+        row = await session.get(PublishedPage, slug)
+        if row is None:
+            return None
+        return {"slug": row.slug, "kind": row.kind, "title": row.title, "html": row.html,
+                "created_at": row.created_at, "model_route": row.model_route, "model_name": row.model_name}
+
+
+async def latest_published_page(kind: str) -> dict | None:
+    from sqlalchemy import select
+
+    async with async_session() as session:
+        q = select(PublishedPage).where(PublishedPage.kind == kind).order_by(PublishedPage.created_at.desc()).limit(1)
+        row = (await session.execute(q)).scalars().first()
+        if row is None:
+            return None
+        return {"slug": row.slug, "kind": row.kind, "title": row.title, "html": row.html,
+                "created_at": row.created_at, "model_route": row.model_route, "model_name": row.model_name}
