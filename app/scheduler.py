@@ -311,7 +311,7 @@ def parse_schedule_add(
                 channel_id=channel_id,
             )
 
-    for standup_prefix in ("daily status", "daily standup", "standup digest", "daily digest"):
+    for standup_prefix in ("daily update", "daily summary", "daily status", "daily standup", "standup digest", "daily digest"):
         if lower_head.startswith(standup_prefix):
             return ParsedScheduleAdd(
                 job_type="standup_digest",
@@ -505,7 +505,7 @@ def _schedule_help_text() -> str:
         "• `schedule list` — show all jobs\n"
         "• `schedule add message \"…\" every weekday at 9:00 in #team-tech`\n"
         "• `schedule add weekly status last calendar week every monday at 9:00 in #team-tech`\n"
-        "• `schedule add daily status every weekday at 10:00 in #team-tech` — the standup "
+        "• `schedule add daily update every weekday at 16:00 in #team-tech` — the daily update (offline standups + Granola) "
         "digest from Granola notes (updates, blockers, decisions, parking lot)\n"
         "• `schedule add actions last 14 days every friday at 16:00 in this channel`\n"
         "• `schedule add board status last 7 days every monday at 9:00 in #team-tech` — the "

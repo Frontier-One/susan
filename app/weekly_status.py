@@ -52,28 +52,34 @@ _WEEKLY_ATTRIBUTION = cleandoc(
 
 _WEEKLY_STRUCTURE = cleandoc(
     """
-    **Output shape** — concise, founder-ready (Jesse should be able to forward this as-is):
+    **Output shape** — tight, founder-ready. Jesse forwards this as-is and reads it in
+    under a minute; it must fit on one Slack screen without scrolling.
 
     - First line: *Tech team update — <plain-language reporting window>*
       (or *Weekly update — …* for non-engineering channels).
 
-    - **3–6 theme sections** (not per-repo dumps). Group PRs, Slack topics, and Drive work
-      by initiative/theme (e.g. *Inference platform*, *Customer onboarding*, *Infra & reliability*).
-      Order sections by business impact — highest priority first.
+    - **3–5 theme sections**, ordered by business impact. A theme is an initiative a
+      non-engineer recognises (*Customer pilots*, *Inference platform*, *Reliability*),
+      never a repository or a person.
 
-    - Each section format:
-      *<Theme> (<@U123> @github-login — people who **shipped** this work)>*
-      - *Shipped / progress:* 2–4 outcome bullets in plain language (impact first, not implementation detail).
-        For PRs: state the count (*12 PRs merged*) and name the theme — do **not** list every PR.
-        At most 1–2 example PR links per theme when a specific change is worth calling out.
-      - *Next:* 1–3 bullets only.
+    - Each section is exactly:
+      *<Theme>* — <@U…> @login (only the people who shipped it)
+      • *Shipped:* one or two bullets, outcome first, one sentence each. Say what
+        changed for a customer, a pilot, cost, or risk — not what was edited. PRs are
+        a count (*9 PRs*) with at most one link when a single change is the story.
+      • *Blocked / at risk:* one bullet, only if real, naming who or what it waits on.
+      • *Next:* one bullet, the single most important thing, with an owner.
 
-    - Skip low-signal noise, stale threads, and deep technical internals unless they affect
-      delivery or customers. Translate engineering work into outcomes a non-engineer founder understands.
+    - Then one closing line, *Decisions this week:* — the decisions taken, semicolon-
+      separated, each with who took it. Omit the line if there were none.
 
-    - Optional one-line *GitHub snapshot* at the end: total merged PRs, top **PR authors (openers)** — no PR-by-PR list.
+    - Hard limits: **350–550 words total**, no more than 12 bullets across the whole
+      update, no section longer than 5 lines. If you are over, cut the least
+      consequential theme entirely rather than shortening every bullet into mush.
 
-    - Target length: ~800–1200 words. Scannable on one Slack screen.
+    - Leave out: dependency bumps, refactors, CI plumbing, doc edits, anything already
+      in last week's update unless its status changed, and every number that does not
+      change what a reader would do. No GitHub snapshot line, no author leaderboard.
 
     - Close with nothing that says the message is a private draft or ephemeral.
     """
@@ -245,7 +251,8 @@ async def process_weekly_status(
                     You are Susan, writing a weekly update for an **engineering / tech** channel
                     that leadership will read. {SUSAN_VOICE}
 
-                    Ground the update in Slack, GitHub, and Drive data provided — but **synthesize**:
+                    Ground the update in Slack, GitHub, and Drive data provided — but **synthesize**, and
+                    keep it short: the reader is a founder skimming Slack, not an engineer auditing a week.
                     - Group merged/opened PRs by **theme**, not repository. Mention PR *counts* per theme;
                       link at most 1–2 exemplar PRs per theme.
                     - Credit **PR openers** (`opener=@login` on each PR line) on theme headers — not reviewers.

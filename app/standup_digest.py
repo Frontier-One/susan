@@ -1,7 +1,13 @@
-"""Daily standup digest built from Granola meeting notes.
+"""Daily update built from the offline standup channel AND the Granola standup meeting.
+
+Since 2026-09-24 the team does a written standup in #team-tech-standups and a recorded
+one (Granola) around 15:00; this digest replaces the standup notes. It is scheduled at
+16:00 into #team-tech and stays HIGH LEVEL: major hits, major blockers and misses, what was
+discussed, decisions — with a Granola link for the detail.
 
 Skills (slash phrasing):
-  /susan daily status [today|yesterday|<range>] [--no-approval]
+  /susan daily update [today|yesterday|<range>] [--no-approval]
+  /susan daily status …   (older alias, same thing)
 """
 from __future__ import annotations
 
@@ -15,13 +21,15 @@ import httpx
 from app.claude_client import call_claude
 from app.config import SUSAN_VOICE, logger
 from app.granola_summarize import collect_granola_notes_matching_terms
-from app.slack_api import notify_user_ephemeral, post_message
+from app.slack_api import fetch_slack_channel_history_since, notify_user_ephemeral, post_message
 from app.weekly_context import parse_weekly_status_time_range, strip_weekly_status_auto_post_flags
 from db import get_granola_token, user_has_granola_tokens
 
 # Longer phrases first so "daily standup" is not consumed by "daily".
 _DAILY_PREFIXES = (
     "daily standup digest",
+    "daily update",
+    "daily summary",
     "daily standup",
     "daily status",
     "daily digest",
@@ -42,6 +50,50 @@ def parse_daily_standup_command(text: str) -> str | None:
         if lower.startswith(prefix + " "):
             return raw[len(prefix) :].strip()
     return None
+
+
+def offline_standup_channel_id() -> str:
+    """The channel where the written (offline) standup is posted each morning."""
+    return (os.environ.get("SUSAN_OFFLINE_STANDUP_CHANNEL") or "C0C35UE399B").strip()
+
+
+def granola_note_url(note: dict[str, Any]) -> str | None:
+    """A link to the Granola note for the footer.
+
+    Prefers a URL the API returned; otherwise builds one from the note id with
+    SUSAN_GRANOLA_NOTE_URL_TEMPLATE (default: Granola's web app note path). Returns
+    None when there is nothing to link, so the footer can say so instead of 404ing.
+    """
+    for key in ("url", "share_url", "public_url", "web_url"):
+        v = note.get(key)
+        if isinstance(v, str) and v.startswith("http"):
+            return v
+    nid = note.get("id")
+    if not isinstance(nid, str) or not nid:
+        return None
+    template = (os.environ.get("SUSAN_GRANOLA_NOTE_URL_TEMPLATE") or "https://notes.granola.ai/d/{id}").strip()
+    return template.replace("{id}", nid)
+
+
+def _window_oldest_slack_ts(since_d: str) -> str:
+    """Slack epoch string for 00:00 UTC on the window's first day."""
+    d = datetime.strptime(since_d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return f"{int(d.timestamp())}.000000"
+
+
+async def fetch_offline_standup_posts(since_d: str, user: str) -> str:
+    """Everything posted in the offline standup channel in the window, threads included."""
+    return await fetch_slack_channel_history_since(
+        offline_standup_channel_id(),
+        _window_oldest_slack_ts(since_d),
+        user,
+        include_thread_replies=True,
+    )
+
+
+def _offline_posts_present(blob: str) -> bool:
+    b = (blob or "").strip()
+    return bool(b) and not b.startswith("(No channel messages")
 
 
 def standup_meeting_terms() -> list[str]:
@@ -181,51 +233,45 @@ def _standup_system_prompt() -> str:
     return cleandoc(
         f"""
         You are Susan. {SUSAN_VOICE}
-        Turn standup meeting notes into a digest the whole team reads in the channel.
+        Write the team's DAILY UPDATE for the #team-tech channel. It replaces the standup
+        notes, so it is read by people who were not in the standup and by people who
+        skim: stay HIGH LEVEL. Outcomes, not activity; the detail lives in Granola.
+
+        You get two sources for the same day: the written standup posts from the offline
+        standup channel (one post per person, sometimes with thread replies) and the
+        Granola notes plus transcript of the spoken standup. Merge them. The same item
+        appearing in both is ONE item. Where they disagree, the transcript is the later
+        word.
 
         Slack mrkdwn only: *single asterisks* for bold, never **double**. No # headings.
-        Refer to people by the names used in the notes.
+        Refer to people by the names used in the sources.
 
-        *Completeness comes first, brevity second.* Write tersely, but never drop a
-        substantive item to save space. It is a failure to omit an update, a blocker,
-        or a decision because the digest was getting long. Every person who spoke gets
-        an entry. Cut words, never content.
+        Sections, in this order. Omit a section that has nothing real in it — never a
+        heading followed by "none".
 
-        Sections, in this order. *Omit any section with nothing real to report* — never
-        emit a heading followed by "none" or "n/a":
+        *Major hits*
+        • Things that shipped, landed, were proven or unblocked today. Name the owner.
+          Only what a team lead would repeat to the CEO; skip routine progress.
 
-        *Updates*
-        • `*<Name>* — what they reported`. One bullet per person; add a second or third
-          bullet under that person when they covered genuinely separate workstreams.
-          Cover *every* person who gave an update. Lead with the outcome, not the process.
+        *Major blockers and misses*
+        • What is stuck and on whom or what; what was promised and did not happen.
+          Name the owner and the dependency. Include anything waiting on a person outside
+          the team, an access request, a review or a decision.
 
-        *Blockers*
-        • `*<Name>* — what is blocked, and who or what is needed to unblock it`.
-          Anything waiting on another person, an access request, a review, a decision,
-          or an external party. Include every one mentioned, even in passing.
+        *Discussed*
+        • Substantive topics that were talked through without reaching a decision, one
+          line each, with who raised it. Skip status chatter already covered above.
 
         *Decisions*
-        • What was decided and by whom. Include every decision reached, including small
-          ones and ones reversing an earlier plan. Not opinions still being weighed.
-
-        *Parking lot*
-        • Topics raised and deliberately deferred, or that ran out of time. Note who
-          raised each so it can be picked up.
-
-        *Discussion*
-        • Substantive discussion that reached no decision. Skip small talk and status
-          chatter already covered under Updates.
-
-        *Next steps*
-        • `*<Name>* — action`. Concrete commitments with an owner. Skip vague intentions.
+        • What was decided and by whom, one line each, including reversals of earlier
+          plans. Not opinions still being weighed.
 
         Rules:
-        - The transcript is authoritative. Granola's own summary is a starting point and
-          routinely omits things — mine the transcript for updates, blockers, and
-          decisions the summary missed.
-        - Ignore greetings, scheduling chatter, and audio problems.
-        - Use only what the notes contain. Never invent an update for someone who did not speak.
-        - If the notes are too thin for a real digest, say so in one line instead of padding.
+        - Target 6 to 14 bullets in total. Cut words, never content that belongs in
+          these four sections; drop everything that does not.
+        - Never invent an item for someone who did not report or speak.
+        - Ignore greetings, scheduling chatter and audio problems.
+        - If both sources are too thin for a real update, say so in one line.
         - No preamble, no sign-off, no "here is".
         """
     )
@@ -234,16 +280,18 @@ def _standup_system_prompt() -> str:
 async def build_standup_digest(
     notes: list[dict[str, Any]],
     range_label: str,
+    offline_posts: str = "",
 ) -> str:
-    """Summarize standup notes into the channel-facing digest body."""
-    bundle = standup_notes_for_prompt(notes, max_chars=_max_transcript_chars())
+    """Summarize the offline posts + Granola notes into the channel-facing daily update."""
+    bundle = standup_notes_for_prompt(notes, max_chars=_max_transcript_chars()) if notes else "(no Granola standup note in this window)"
     attendees = sorted({a for n in notes for a in _note_attendee_names(n)})
     roster = ", ".join(attendees) if attendees else "(not listed)"
+    posts = (offline_posts or "").strip() or "(no posts in the offline standup channel in this window)"
     user_prompt = (
-        f"Standup window: {range_label}.\n"
-        f"Attendees across these meetings: {roster}.\n"
-        "Every attendee who spoke must appear under Updates.\n\n"
-        f"--- Granola standup notes ({len(notes)} meeting(s)) ---\n{bundle}"
+        f"Window: {range_label}.\n"
+        f"Attendees of the spoken standup: {roster}.\n\n"
+        f"--- Source 1: offline standup channel posts (one per person, threads included) ---\n{posts}\n\n"
+        f"--- Source 2: Granola standup notes ({len(notes)} meeting(s)) ---\n{bundle}"
     )
     summary = await call_claude(
         _standup_system_prompt(),
@@ -254,11 +302,23 @@ async def build_standup_digest(
     return summary
 
 
+def daily_update_footer(notes: list[dict[str, Any]]) -> str:
+    """The detail pointers under the update: Granola note link(s) + the offline channel."""
+    links: list[str] = []
+    for n in notes:
+        url = granola_note_url(n)
+        title = (n.get("title") or "standup").strip()
+        links.append(f"<{url}|{title}>" if url else title)
+    granola = ", ".join(links) if links else "no Granola note found for this window"
+    return f"\n\n_Details: Granola — {granola} · written standups — <#{offline_standup_channel_id()}>_"
+
+
 def _no_notes_message(range_label: str, scanned: int, terms: list[str]) -> str:
     term_list = ", ".join(f"`{t}`" for t in terms)
     return (
         f"No standup meeting found in Granola for *{range_label}* "
-        f"(scanned {scanned} note(s), matching {term_list}).\n"
+        f"(scanned {scanned} note(s), matching {term_list}), and nothing was posted in "
+        f"<#{offline_standup_channel_id()}> either — nothing to summarize.\n"
         "_If your standup is titled differently, set `SUSAN_STANDUP_MEETING_TERMS` "
         "on the server to a comma-separated list of title words._"
     )
@@ -292,6 +352,14 @@ async def process_standup_digest(
         )
         return
 
+    offline_posts = ""
+    try:
+        offline_posts = await fetch_offline_standup_posts(since_d, user)
+    except Exception as e:
+        logger.warning("Offline standup channel fetch failed: %s", e)
+        offline_posts = ""
+    has_posts = _offline_posts_present(offline_posts)
+
     terms = standup_meeting_terms()
     try:
         bearer = await get_granola_token(user)
@@ -320,14 +388,14 @@ async def process_standup_digest(
         )
         return
 
-    if not notes:
+    if not notes and not has_posts:
         await notify_user_ephemeral(
             channel, user, _no_notes_message(range_label, scanned, terms), None, response_url
         )
         return
 
     try:
-        summary = await build_standup_digest(notes, range_label)
+        summary = await build_standup_digest(notes, range_label, offline_posts if has_posts else "")
     except Exception as e:
         logger.exception("Standup digest summarization failed")
         await notify_user_ephemeral(
@@ -352,7 +420,8 @@ async def process_standup_digest(
 
     model_route = getattr(summary, "model_route", None)
     model_name = getattr(summary, "model_name", None)
-    header = f"*Standup — {range_label}*\n\n"
+    header = f"*Daily update — {range_label}*\n\n"
+    body = body + daily_update_footer(notes)
 
     if auto_publish:
         try:
@@ -366,7 +435,7 @@ async def process_standup_digest(
             await notify_user_ephemeral(
                 channel,
                 user,
-                "✓ Posted the *standup digest* to the channel — everyone here can see it.",
+                "✓ Posted the *daily update* to the channel — everyone here can see it.",
                 None,
                 response_url,
             )
@@ -381,8 +450,8 @@ async def process_standup_digest(
         header
         + body
         + "\n\n_Only you can see this. Post it with "
-        + "`/susan daily status --no-approval`, or schedule it with "
-        + "`/susan schedule add daily status every weekday at 10:00 in this channel`._"
+        + "`/susan daily update --no-approval`, or schedule it with "
+        + "`/susan schedule add daily update every weekday at 16:00 in #team-tech`._"
     )
     await notify_user_ephemeral(
         channel,
