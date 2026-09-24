@@ -13,6 +13,16 @@ from app.standup_digest import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_slack_offline_fetch(monkeypatch: pytest.MonkeyPatch):
+    """Default: the offline standup channel is empty, so existing Granola-only tests hold."""
+
+    async def none(since_d: str, user: str) -> str:
+        return "(No channel messages in this time window.)"
+
+    monkeypatch.setattr(sd, "fetch_offline_standup_posts", none)
+
+
 def test_parse_daily_standup_command() -> None:
     assert parse_daily_standup_command("daily status") == ""
     assert parse_daily_standup_command("daily status yesterday") == "yesterday"
@@ -119,7 +129,10 @@ async def test_auto_publish_posts_to_channel(monkeypatch: pytest.MonkeyPatch) ->
     )
 
     assert posted["channel"] == "C1"
-    assert "*Standup — today*" in posted["text"]
+    assert "*Daily update — today*" in posted["text"]
+    # The footer points at the detail: the Granola note (built from its id) and the channel.
+    assert "notes.granola.ai/d/not_1" in posted["text"]
+    assert "<#C0C35UE399B>" in posted["text"]
     assert "*Ana* — shipped the parser" in posted["text"]
     # Attribution must follow the model that actually served the request.
     assert posted["model_route"] == "sovereign"
@@ -290,10 +303,91 @@ def test_prompt_survives_note_without_transcript() -> None:
     assert "Full transcript" not in bundle
 
 
-def test_system_prompt_prioritises_completeness() -> None:
+def test_system_prompt_is_high_level_and_two_source() -> None:
     p = sd._standup_system_prompt()
-    assert "Completeness comes first" in p
+    for section in ("*Major hits*", "*Major blockers and misses*", "*Discussed*", "*Decisions*"):
+        assert section in p
+    assert "HIGH LEVEL" in p
+    assert "Merge them" in p and "ONE item" in p
     assert "Cut words, never content" in p
+    # The per-person "Updates" digest is gone: this replaces the standup notes.
+    assert "*Updates*" not in p
+
+
+def test_parse_daily_update_alias() -> None:
+    assert sd.parse_daily_standup_command("daily update") == ""
+    assert sd.parse_daily_standup_command("daily update yesterday --no-approval") == "yesterday --no-approval"
+    assert sd.parse_daily_standup_command("daily summary") == ""
+
+
+def test_granola_note_url_prefers_api_url_then_builds_from_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert sd.granola_note_url({"id": "not_9", "url": "https://x.example/n/9"}) == "https://x.example/n/9"
+    assert sd.granola_note_url({"id": "not_9"}) == "https://notes.granola.ai/d/not_9"
+    monkeypatch.setenv("SUSAN_GRANOLA_NOTE_URL_TEMPLATE", "https://g.example/{id}")
+    assert sd.granola_note_url({"id": "not_9"}) == "https://g.example/not_9"
+    assert sd.granola_note_url({"title": "no id"}) is None
+
+
+@pytest.mark.asyncio
+async def test_offline_posts_alone_produce_an_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No Granola meeting found, but people posted in #team-tech-standups: still an update."""
+    from app.claude_client import ModelCompletion
+
+    async def has_tokens(user: str) -> bool:
+        return True
+
+    async def token(user: str) -> str:
+        return "tok"
+
+    async def no_notes(*a: object, **k: object) -> tuple[list, int]:
+        return [], 3
+
+    async def posts(since_d: str, user: str) -> str:
+        return "U1: shipped the parser\nU2: blocked on the API key"
+
+    seen: dict[str, str] = {}
+
+    async def fake_completion(system: str, user_prompt: str, **kw: object) -> ModelCompletion:
+        seen["prompt"] = user_prompt
+        return ModelCompletion("*Major hits*\n• *Ana* — parser shipped", model_route="r", model_name="m")
+
+    posted: dict[str, object] = {}
+
+    async def fake_post(channel, text, **kwargs):
+        posted.update(channel=channel, text=text)
+        return {"ok": True}
+
+    async def fake_notify(*a, **k):
+        return None
+
+    monkeypatch.setattr(sd, "user_has_granola_tokens", has_tokens)
+    monkeypatch.setattr(sd, "get_granola_token", token)
+    monkeypatch.setattr(sd, "collect_granola_notes_matching_terms", no_notes)
+    monkeypatch.setattr(sd, "fetch_offline_standup_posts", posts)
+    monkeypatch.setattr(sd, "call_claude", fake_completion)
+    monkeypatch.setattr(sd, "post_message", fake_post)
+    monkeypatch.setattr(sd, "notify_user_ephemeral", fake_notify)
+
+    await sd.process_standup_digest("daily update --no-approval", "C1", "U1", None, None)
+
+    assert "Source 1: offline standup channel posts" in seen["prompt"]
+    assert "blocked on the API key" in seen["prompt"]
+    assert "no Granola standup note" in seen["prompt"]
+    assert "*Daily update — today*" in posted["text"]
+    assert "no Granola note found" in posted["text"]
+
+
+def test_schedule_add_parses_daily_update() -> None:
+    from app.scheduler import parse_schedule_add
+
+    parsed = parse_schedule_add(
+        "add daily update every weekday at 16:00 in C0ANY6ASRB5",
+        slash_channel_id="C1",
+        slash_channel_name="general",
+    )
+    assert parsed is not None
+    assert parsed.job_type == "standup_digest"
+    assert (parsed.hour, parsed.minute) == (16, 0)
 
 
 @pytest.mark.asyncio
@@ -331,7 +425,8 @@ async def test_digest_requests_the_transcript(monkeypatch: pytest.MonkeyPatch) -
 
     assert seen["include_transcript"] is True
     assert "I am blocked on the API key." in str(seen["prompt"])
-    assert "Every attendee who spoke must appear" in str(seen["prompt"])
+    # The prompt is two-source and high level now; the transcript still reaches the model.
+    assert "Source 2: Granola standup notes" in str(seen["prompt"])
     assert int(seen["max_tokens"] or 0) >= 8192
 
 
