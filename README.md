@@ -95,6 +95,7 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 - `/susan create issue …`, `create pr …` (GitHub OAuth + allowlists)
 - `/susan summarize merged prs …` / keywords like `pr summary` — merged PRs over a date range, preview then approve to post to channel
 - `/susan weekly status …` — Structured update (*workstreams* with *1. Last week* / *2. Next steps* and links) from **Slack messages**, **channel bookmarks**, **Google Drive**, and **all `GITHUB_REPOS`** in tech channels. Publishes the full report to a **Slack Canvas** and posts a short link in the channel (needs `canvases:write` + `files:read`; falls back to long channel messages if Canvas is unavailable). Optional `--no-approval` (restrict with `SUSAN_WEEKLY_AUTO_POST_USER_IDS`).
+- `/susan daily update …` (alias `daily status`) — The team's daily update: *Major hits · Major blockers and misses · Discussed · Decisions*, merged from the written standups in `#team-tech-standups` (`SUSAN_OFFLINE_STANDUP_CHANNEL`) and the Granola standup meeting, with a Granola link for detail. Scheduled at 16:00 into `#team-tech` it replaces the standup notes.
 - `/susan standups …` — Summarize daily standup notes from `#team-tech` (threads) for a date window
 - `/susan surface failures` / `what's failing` — Digest of failing CI/promote/cost alerts from configured alert channels
 - `/susan babysit` / `pr farm` — Trigger the dev-tools PR farm to babysit open PRs to green (needs `FARM_BASE_URL`)
