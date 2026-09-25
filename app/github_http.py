@@ -371,10 +371,12 @@ async def fetch_pr_human_signals(repo: str, pr_number: int, token: str) -> dict:
     out = {
         "first_human_touch": None,
         "human_touches": 0,
+        "agent_touches": 0,
         "changes_requested": 0,
         "blocking_findings": 0,
         "findings_by_severity": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
         "human_logins": set(),
+        "paid_reviewed": False,
     }
     async with _PR_SUMMARY_PARTICIPANT_SEM:
         async with httpx.AsyncClient(timeout=45) as client:
@@ -398,7 +400,15 @@ async def fetch_pr_human_signals(repo: str, pr_number: int, token: str) -> dict:
                             out["blocking_findings"] += 1
                     user = (it.get("user") or {})
                     login = str(user.get("login") or "")
-                    if not login or user.get("type") == "Bot" or login.endswith("[bot]"):
+                    if not login:
+                        continue
+                    if user.get("type") == "Bot" or login.endswith("[bot]"):
+                        # Reviewers, the farm and the approver. Counted separately so the
+                        # update can say what a change cost in HUMAN attention versus
+                        # agent attention, rather than folding them into one number.
+                        out["agent_touches"] += 1
+                        if "cubic" in login.lower():
+                            out["paid_reviewed"] = True
                         continue
                     out["human_logins"].add(login)
                     out["human_touches"] += 1

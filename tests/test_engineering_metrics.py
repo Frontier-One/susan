@@ -48,9 +48,13 @@ def test_lead_time_is_open_to_merge_and_none_when_unmergeable() -> None:
     assert lead_time_hours(bad) is None
 
 
-def test_rework_and_revert_detection() -> None:
+def test_rework_and_revert_are_DIFFERENT_things() -> None:
+    """They shared a definition until 2026-09-25 and so always reported the same
+    number, which told us nothing. A revert is a change we pulled back (change
+    failure); a fix is a change that corrected an earlier one (rework)."""
     assert is_rework(pr(title="fix(auth): 401 on the scrape"))
-    assert is_rework(pr(title="Revert \"feat: thing\""))
+    assert not is_rework(pr(title="Revert \"feat: thing\"")), "a revert is change failure, not rework"
+    assert is_revert(pr(title="Revert \"feat: thing\""))
     assert is_rework(pr(title="feat: x", head="fix/1234-thing"))
     assert not is_rework(pr(title="feat(gateway): add glm edge"))
     # "fix" inside a sentence is not a fix PR.
@@ -102,10 +106,57 @@ def test_render_shows_throughput_with_its_failure_signals() -> None:
     assert "proxies" in out.lower()      # Intent→Prod and Human Attention are labelled
 
 
-def test_an_uninstrumented_metric_says_so_by_name() -> None:
-    """Omitting it would read as 'nothing to report' for something simply not measured."""
+def test_unconfigured_cost_says_so_and_names_the_setting() -> None:
+    """Omitting it would read as 'nothing to report' for something simply not set up."""
+    import os
+
+    os.environ.pop("SUSAN_TOOL_SPEND_MONTHLY", None)
+    os.environ.pop("SUSAN_TOOL_SPEND_WEEKLY", None)
     out = render(compute([pr()], [], now=NOW))
-    assert "AI Cost / Shipped Change" in out and "not instrumented" in out
+    assert "Paid-tool cost / change" in out and "not configured" in out
+    assert "SUSAN_TOOL_SPEND_MONTHLY" in out
+
+
+def test_paid_spend_is_configured_monthly_and_divided_by_what_shipped() -> None:
+    """Cost comes from what we PAY for tools, not from a token ledger nobody keeps."""
+    import os
+
+    from app.engineering_metrics import tool_spend_per_week
+
+    os.environ["SUSAN_TOOL_SPEND_MONTHLY"] = "claude=1000,cubic=304.4"
+    try:
+        weekly, cur, names = tool_spend_per_week()
+        assert cur == "GBP" and set(names) == {"claude", "cubic"}
+        assert weekly == pytest.approx(1304.4 * 7 / 30.44, abs=0.05)
+        out = render(compute([pr(), pr()], [], now=NOW))
+        assert "Paid-tool cost / change" in out and "over 2 changes" in out
+    finally:
+        del os.environ["SUSAN_TOOL_SPEND_MONTHLY"]
+
+
+def test_change_failure_counts_reverts_only_and_rework_counts_fixes_only() -> None:
+    m = compute([pr(), pr(title="Revert \"x\""), pr(title="fix(a): b"), pr(title="fix(c): d")], [], now=NOW)
+    assert m.change_failure_pct == 25.0     # 1 revert of 4
+    assert m.rework_pct == 50.0             # 2 fixes of 4, the revert excluded
+    out = render(m)
+    assert "REVERT" in out and "FIXED an earlier one" in out
+
+
+def test_shipped_states_the_window_and_breaks_down_by_repo() -> None:
+    out = render(compute([pr(), pr()], [], repos=2, window_days=7,
+                         per_repo=[("Frontier-One/cloud-infra", 2), ("Frontier-One/dev-tools", 0)], now=NOW))
+    assert "merged in the last 7 days" in out
+    assert "cloud-infra 2 · dev-tools 0" in out
+
+
+def test_human_and_agent_touches_are_reported_separately() -> None:
+    merged = [_agent_pr(1)]
+    sig = {"o/r#1": {"first_human_touch": None, "human_touches": 3, "agent_touches": 9,
+                     "changes_requested": 0, "blocking_findings": 0, "paid_reviewed": True}}
+    m = compute(merged, [], signals=sig, now=NOW)
+    assert m.human_touches_per_change == 3.0 and m.agent_touches_per_change == 9.0
+    assert m.paid_reviewed_pct == 100.0
+    assert "3 human vs 9 agent touches per change" in render(m)
 
 
 def test_percentage_metrics_move_in_POINTS_not_relative_percent() -> None:
