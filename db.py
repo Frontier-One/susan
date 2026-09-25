@@ -340,6 +340,21 @@ class ActionItemChannelTab(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class MetricSnapshot(Base):
+    """One reporting window's computed engineering metrics, so trends are real.
+
+    A week-over-week delta the MODEL remembers is a delta the model invents. This is
+    the previous window's arithmetic, keyed by the window's end date so a re-run of
+    the same week overwrites rather than duplicates.
+    """
+
+    __tablename__ = "metric_snapshots"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)   # e.g. "weekly:2026-09-24"
+    payload: Mapped[str] = mapped_column(Text, nullable=False)       # JSON
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class PublishedPage(Base):
     """An HTML page Susan rendered and hosts (GET /status/{slug}); e.g. the environment status."""
 
@@ -1163,3 +1178,45 @@ async def latest_published_page(kind: str) -> dict | None:
             return None
         return {"slug": row.slug, "kind": row.kind, "title": row.title, "html": row.html,
                 "created_at": row.created_at, "model_route": row.model_route, "model_name": row.model_name}
+
+
+# ── Metric snapshots (week-over-week trends, computed not remembered) ──────────────────
+
+
+async def upsert_metric_snapshot(key: str, payload: dict) -> None:
+    import json as _json
+
+    async with SessionLocal() as session:
+        row = await session.get(MetricSnapshot, key)
+        now = datetime.now(timezone.utc)
+        if row is None:
+            session.add(MetricSnapshot(key=key, payload=_json.dumps(payload), created_at=now))
+        else:
+            row.payload, row.created_at = _json.dumps(payload), now
+        await session.commit()
+
+
+async def previous_metric_snapshot(prefix: str, before_key: str) -> dict | None:
+    """The most recent snapshot under ``prefix`` STRICTLY older than ``before_key``.
+
+    Keyed comparison, not "the second newest row": re-running this week must not turn
+    this week into its own baseline and report every delta as flat.
+    """
+    import json as _json
+
+    from sqlalchemy import select
+
+    async with SessionLocal() as session:
+        q = (
+            select(MetricSnapshot)
+            .where(MetricSnapshot.key.like(f"{prefix}%"), MetricSnapshot.key < before_key)
+            .order_by(MetricSnapshot.key.desc())
+            .limit(1)
+        )
+        row = (await session.execute(q)).scalars().first()
+        if row is None:
+            return None
+        try:
+            return _json.loads(row.payload)
+        except Exception:
+            return None

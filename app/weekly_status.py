@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import json
 import os
 from collections import Counter
 from inspect import cleandoc
 
-from db import create_user_draft, get_github_token
+from db import create_user_draft, get_github_token, previous_metric_snapshot, upsert_metric_snapshot
 
-from app.claude_client import call_claude
+from app.claude_client import ModelCompletion, call_claude
 from app.config import ACTIONS, SUSAN_VOICE, logger
 from app.github_http import (
     _pr_turnaround_hours,
@@ -22,6 +23,8 @@ from app.slack_api import (
     notify_user_ephemeral,
     slack_channel_bookmarks_for_weekly,
 )
+from app.engineering_metrics import compute as compute_engineering_metrics
+from app.engineering_metrics import render as render_engineering_metrics
 from app.weekly_canvas import publish_weekly_status
 from app.weekly_context import parse_weekly_status_time_range, utc_date_start_slack_ts
 from app.weekly_drive import weekly_status_drive_activity_block
@@ -133,6 +136,8 @@ async def process_weekly_status(
         extra_google_urls=bookmark_google,
     )
     bookmark_section = f"\n---\n{bookmark_md}\n" if bookmark_md else ""
+    # Set by the GitHub branch below; the Slack-only branch has no PR data to count.
+    metrics_block = ""
 
     if include_github:
         if not repos:
@@ -233,6 +238,28 @@ async def process_weekly_status(
             )
 
         facts = "\n\n".join(github_sections)
+
+        # ── team-level engineering metrics: arithmetic, then a stored snapshot ──────
+        # Computed here and rendered in Python because a model that can restate a
+        # number can restate it wrong, and because a week-over-week delta the model
+        # remembers is a delta the model invents. See app/engineering_metrics.py for
+        # why these metrics and not others (DORA's keys, and its warnings).
+        try:
+            all_merged = [pr for _r, mg, _o, _d in per_repo for pr in mg]
+            all_opened = [pr for _r, _m, op, _d in per_repo for pr in op]
+            em = compute_engineering_metrics(
+                all_merged, all_opened, repos=len(per_repo),
+                window_days=max(1, (
+                    _dt.date.fromisoformat(until_d) - _dt.date.fromisoformat(since_d)
+                ).days + 1),
+            )
+            snap_key = f"weekly:{until_d}"
+            prev = await previous_metric_snapshot("weekly:", snap_key)
+            metrics_block = render_engineering_metrics(em, prev)
+            await upsert_metric_snapshot(snap_key, em.as_row())
+        except Exception as e:  # metrics must never take the weekly down
+            logger.warning("Weekly engineering metrics failed: %s", e)
+            metrics_block = ""
         user_prompt = (
             f"Reporting window: {range_label}.\n"
             "Sources (synthesize into themed sections — do not dump raw tables or list every PR):\n"
@@ -317,6 +344,15 @@ async def process_weekly_status(
     title = _weekly_status_title_line(repos, range_label, include_github=include_github)
     model_route = summary.model_route
     model_name = summary.model_name
+    if metrics_block:
+        # APPENDED, never handed to the model. Giving it the block and asking for it
+        # back verbatim is one paraphrase away from a wrong number in a founder-facing
+        # update; appending is the only way the arithmetic is guaranteed to survive.
+        summary = ModelCompletion(
+            f"{str(summary).rstrip()}\n\n{metrics_block}",
+            model_route=model_route,
+            model_name=model_name,
+        )
     if auto_publish:
         try:
             await publish_weekly_status(
