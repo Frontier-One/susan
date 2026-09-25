@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import re
 
-from app.config import logger
+from app.config import F1_ATTRIBUTION, logger
 from app.slack_api import (
     post_message,
     slack_user_display_name,
@@ -174,10 +174,28 @@ def slack_mrkdwn_to_canvas_markdown(text: str, names: dict[str, str] | None = No
     return s.strip()
 
 
-def _canvas_document_markdown(title: str, body: str, names: dict[str, str] | None = None) -> str:
+def _canvas_document_markdown(
+    title: str,
+    body: str,
+    names: dict[str, str] | None = None,
+    *,
+    model_route: str | None = None,
+    model_name: str | None = None,
+) -> str:
+    """The Canvas document, including WHICH MODEL wrote it.
+
+    The attribution rides the Slack message but not the Canvas, so moving the update
+    into a Canvas silently dropped it — and the model that wrote an update leadership
+    forwards is not a detail to lose.
+    """
     converted = slack_mrkdwn_to_canvas_markdown(body, names)
     title_line = (title or "Weekly status").strip()
-    parts = [f"# {title_line}", "", converted, "", "---", "_Posted via Susan_"]
+    if (model_route or "").strip().lower() == "sovereign":
+        served = (model_name or "").strip()
+        footer = f"_{F1_ATTRIBUTION}{f' ({served})' if served else ''} · Posted via Susan_"
+    else:
+        footer = "_Posted via Susan_"
+    parts = [f"# {title_line}", "", converted, "", "---", footer]
     return "\n".join(p for p in parts if p is not None)
 
 
@@ -227,7 +245,9 @@ async def _publish_weekly_status_to_canvas(
             names[uid] = await slack_user_display_name(uid)
         except Exception as e:  # a name is cosmetic; never fail the publish for one
             logger.warning("canvas: could not resolve %s: %s", uid, e)
-    markdown = _canvas_document_markdown(title, body, names)
+    markdown = _canvas_document_markdown(
+        title, body, names, model_route=model_route, model_name=model_name
+    )
     canvas_id = await slack_api_canvases_create(
         title=(title or "Weekly status")[:150],
         markdown=markdown,

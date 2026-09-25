@@ -140,6 +140,26 @@ def weekly_extra_channel_ids(exclude: str = "") -> list[str]:
     return out
 
 
+_OBSERVATION_MARKERS = ("*What changed:*", "*Where we're losing time:*", "*Action:*")
+
+
+def _separate_observation_lines(body: str) -> str:
+    """Put each observation on its own line.
+
+    The model runs the three together in one paragraph, and a bare newline is not a
+    line break in markdown — so in a Canvas they arrived as a wall (reported
+    2026-09-25). Idempotent: a marker already at the start of a line is left alone.
+    """
+    out = body
+    for mk in _OBSERVATION_MARKERS:
+        parts = out.split(mk)
+        rebuilt = parts[0]
+        for chunk in parts[1:]:
+            rebuilt = rebuilt.rstrip() + "\n\n" + mk + chunk
+        out = rebuilt
+    return out
+
+
 def _weekly_meeting_cap() -> int:
     n = int((os.environ.get("WEEKLY_STATUS_MAX_MEETINGS") or "12").strip() or "12")
     return max(1, min(40, n))
@@ -484,7 +504,7 @@ async def process_weekly_status(
         # one paraphrase is one wrong number in a founder-facing update. The model is
         # given it read-only and asked for three interpretation lines, which belong
         # UNDER it, so the block goes in immediately before the first of them.
-        body = str(summary).rstrip()
+        body = _separate_observation_lines(str(summary).rstrip())
         cut = min(
             (i for i in (body.find(mk) for mk in ("*What changed:*", "*Where we're losing time:*", "*Action:*")) if i != -1),
             default=-1,
