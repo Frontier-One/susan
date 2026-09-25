@@ -61,9 +61,30 @@ async def _call_f1_sovereign(
     max_attempts = max(1, min(8, int(os.environ.get("F1_MODEL_MAX_RETRIES", "4"))))
     base_delay = max(1.0, float(os.environ.get("F1_MODEL_RETRY_DELAY_SECONDS", "2")))
     last = ""
+    # Configurable, and RETRIED on timeout (2026-09-24). A self-hosted model on a
+    # busy GPU is slow in a way a hosted API is not: the status-page narrative
+    # against GLM-5.3-Flash exceeded the old hardcoded 180s and raised
+    # httpx.ReadTimeout straight out of this loop, so the caller saw a hard failure
+    # on the one class of error the retry loop exists for. A timeout now costs an
+    # attempt like any other transport error.
+    read_timeout = max(30.0, float(os.environ.get("F1_MODEL_TIMEOUT_SECONDS", "180")))
+    timeout = httpx.Timeout(30.0, read=read_timeout)
     for attempt in range(max_attempts):
-        async with httpx.AsyncClient(timeout=180) as client:
-            r = await client.post(url, headers=headers, json=body)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(url, headers=headers, json=body)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+            last = f"{type(e).__name__} after {read_timeout:.0f}s"
+            logger.warning(
+                "F1 sovereign timeout attempt=%s/%s timeout=%ss", attempt + 1, max_attempts, read_timeout
+            )
+            if attempt + 1 >= max_attempts:
+                raise RuntimeError(
+                    f"F1 sovereign model did not answer within {read_timeout:.0f}s after "
+                    f"{max_attempts} attempt(s). Raise F1_MODEL_TIMEOUT_SECONDS, or send it less."
+                ) from e
+            await asyncio.sleep(base_delay * (2 ** attempt))
+            continue
         if r.status_code < 400:
             try:
                 data = r.json()
