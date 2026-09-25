@@ -66,15 +66,23 @@ def _labels(pr: dict) -> set[str]:
 
 
 def is_rework(pr: dict) -> bool:
-    """A merged PR that exists because an earlier change was wrong.
+    """A merged PR that exists to REMEDIATE an earlier change (a fix or a hotfix).
+
+    The other half of the pair with :func:`is_revert`. A revert says a change FAILED
+    and was withdrawn; a fix says a change was wrong and was corrected in place. Both
+    are remediation, and they answer different questions: change failure asks how
+    often we had to pull something back, rework asks how much of the week's output
+    was correcting ourselves rather than moving forward.
 
     Title-based, deliberately: the branch name is not in the search API's payload
     for every result, and a title is what a human would call it. Conservative — a
     `fix(...)` that is a first-time fix of an old bug counts as rework here, which
     OVERSTATES the rate rather than flattering it. Stated wherever it is rendered.
     """
+    if is_revert(pr):
+        return False          # a revert is a change FAILURE, counted there, not here
     title = str(pr.get("title") or "")
-    if _REVERT_RE.match(title) or _FIX_TITLE_RE.match(title):
+    if _FIX_TITLE_RE.match(title):
         return True
     head = ((pr.get("pull_request") or {}).get("head") or {}).get("ref") or ""
     return bool(_FIX_BRANCH_RE.match(str(head)))
@@ -149,6 +157,11 @@ class EngineeringMetrics:
     first_pass_agent_pct: float | None = None         # agent PRs merged with no P0/P1/P2 finding
     blocking_findings_per_change: float | None = None
     signals_covered: int = 0                          # PRs we could read review data for
+    per_repo: list[tuple[str, int]] = field(default_factory=list)
+    agent_touches_per_change: float | None = None
+    paid_reviewed_pct: float | None = None
+    paid_spend_week: float | None = None
+    spend_currency: str = "GBP"
     notes: list[str] = field(default_factory=list)
 
     def as_row(self) -> dict[str, Any]:
@@ -169,6 +182,8 @@ class EngineeringMetrics:
             "human_touches_per_change": self.human_touches_per_change,
             "first_pass_agent_pct": self.first_pass_agent_pct,
             "blocking_findings_per_change": self.blocking_findings_per_change,
+            "agent_touches_per_change": self.agent_touches_per_change,
+            "paid_reviewed_pct": self.paid_reviewed_pct,
         }
 
 
@@ -177,11 +192,40 @@ def _stale_days() -> int:
     return max(1, min(30, n))
 
 
+def tool_spend_per_week() -> tuple[float | None, str, list[str]]:
+    """Weekly spend on PAID tooling, from config — not from a token ledger.
+
+    ``SUSAN_TOOL_SPEND_MONTHLY`` is ``name=amount`` pairs, e.g.
+    ``claude=1200,cursor=180,github-actions=300,cubic=400``. Monthly because that is
+    how these are invoiced; converted at 7/30.44. ``SUSAN_TOOL_SPEND_WEEKLY`` overrides
+    for anything billed weekly. Returns (weekly total, currency, tool names) or
+    (None, …) when nothing is configured — in which case the line says so rather than
+    printing a zero that would read as "we spend nothing".
+    """
+    cur = (os.environ.get("SUSAN_TOOL_SPEND_CURRENCY") or "GBP").strip() or "GBP"
+    total = 0.0
+    names: list[str] = []
+    found = False
+    for var, factor in (("SUSAN_TOOL_SPEND_MONTHLY", 7.0 / 30.44), ("SUSAN_TOOL_SPEND_WEEKLY", 1.0)):
+        for pair in (os.environ.get(var) or "").split(","):
+            if "=" not in pair:
+                continue
+            name, _, amount = pair.partition("=")
+            try:
+                total += float(amount.strip()) * factor
+            except ValueError:
+                continue
+            names.append(name.strip())
+            found = True
+    return (round(total, 2) if found else None), cur, names
+
+
 def compute(
     merged: Iterable[dict],
     opened: Iterable[dict],
     *,
     repos: int = 0,
+    per_repo: list[tuple[str, int]] | None = None,
     window_days: int = 7,
     now: datetime | None = None,
     signals: dict[str, dict] | None = None,
@@ -191,7 +235,7 @@ def compute(
     merged = [p for p in merged if isinstance(p, dict)]
     opened = [p for p in opened if isinstance(p, dict)]
     m = EngineeringMetrics(window_days=window_days, repos=repos, stale_days=_stale_days(),
-                           iso_week=now.isocalendar().week)
+                           iso_week=now.isocalendar().week, per_repo=list(per_repo or []))
     m.merged = len(merged)
     m.opened = len(opened)
 
@@ -221,13 +265,18 @@ def compute(
     # Change failure: a revert, or a fix merged within the window that follows a change
     # in it. Narrower than rework on purpose — rework counts any fix, this counts the
     # ones that plausibly follow one of THIS window's deliveries.
+    # Change failure: a change we had to PULL BACK. A revert is unambiguous evidence
+    # that a merged change failed, which is why it is the whole of this number and
+    # nothing else is. Rework (fixes) is counted separately — the two used to share a
+    # definition and therefore always reported the same figure, which told us nothing.
     if merged:
-        m.change_failure_pct = _pct(sum(1 for p in merged if is_revert(p) or _is_hotfix(p)), len(merged))
+        m.change_failure_pct = _pct(sum(1 for p in merged if is_revert(p)), len(merged))
 
     # ── human-in-the-loop, only where we could read the reviews ──
     if signals:
         lat, touch, touches, findings = [], [], [], []
-        agent_total = agent_clean = 0
+        agent_touch_counts: list[int] = []
+        agent_total = agent_clean = paid_reviewed = 0
         covered = 0
         for p in merged:
             key = _pr_key(p)
@@ -239,6 +288,9 @@ def compute(
             mg = _iso((p.get("pull_request") or {}).get("merged_at"))
             first = _iso(sig.get("first_human_touch"))
             touches.append(int(sig.get("human_touches") or 0))
+            agent_touch_counts.append(int(sig.get("agent_touches") or 0))
+            if sig.get("paid_reviewed"):
+                paid_reviewed += 1
             blocking = int(sig.get("blocking_findings") or 0)
             findings.append(blocking)
             if c and first and first >= c:
@@ -260,10 +312,17 @@ def compute(
             m.human_touch_median_h = round(statistics.median(touch), 1)
         if touches:
             m.human_touches_per_change = round(statistics.mean(touches), 1)
+        if agent_touch_counts:
+            m.agent_touches_per_change = round(statistics.mean(agent_touch_counts), 1)
+        if covered:
+            m.paid_reviewed_pct = _pct(paid_reviewed, covered)
         if findings:
             m.blocking_findings_per_change = round(statistics.mean(findings), 1)
         if agent_total:
             m.first_pass_agent_pct = _pct(agent_clean, agent_total)
+
+    spend, cur, _tools = tool_spend_per_week()
+    m.paid_spend_week, m.spend_currency = spend, cur
     return m
 
 
@@ -320,22 +379,31 @@ def render(m: EngineeringMetrics, prev: dict[str, Any] | None = None) -> str:
     # the •, and the Canvas converter turns it into a real list item.
     L: list[str] = [f"*ENGINEERING — WEEK {m.iso_week}*" if m.iso_week else "*ENGINEERING*", ""]
 
-    L.append(f"• *Shipped:* {m.merged} changes{_fmt_delta(m.merged, p.get('merged'), unit='pct', lower_is_better=False)}"
-             + (f" across {m.repos} repos" if m.repos else ""))
+    # A "change" is one merged pull request, and the window is stated, because
+    # "1,260 changes" invites the reasonable question "this week, or ever?".
+    L.append(f"• *Shipped:* {m.merged} changes merged in the last {m.window_days} days"
+             f"{_fmt_delta(m.merged, p.get('merged'), unit='pct', lower_is_better=False)}")
+    if m.per_repo:
+        L.append("   " + " · ".join(f"{r.split('/')[-1]} {n}" for r, n in m.per_repo))
     L.append(f"• *Intent → Prod:* {_hours(m.lead_time_median_h)} median"
              f"{_fmt_delta(m.lead_time_median_h, p.get('lead_time_median_h'), unit='pct', lower_is_better=True)}"
              f" · p90 {_hours(m.lead_time_p90_h)}")
     L.append(f"• *Change Failure:* {'n/a' if m.change_failure_pct is None else f'{m.change_failure_pct:g}%'}"
-             f"{_fmt_delta(m.change_failure_pct, p.get('change_failure_pct'), unit='pp', lower_is_better=True)}")
+             f"{_fmt_delta(m.change_failure_pct, p.get('change_failure_pct'), unit='pp', lower_is_better=True)}"
+             " — changes we had to REVERT")
     L.append(f"• *Rework:* {'n/a' if m.rework_pct is None else f'{m.rework_pct:g}%'}"
-             f"{_fmt_delta(m.rework_pct, p.get('rework_pct'), unit='pp', lower_is_better=True)}")
-    L.append(f"• *Agent-executed:* {'n/a' if m.agent_authored_pct is None else f'{m.agent_authored_pct:g}%'}"
+             f"{_fmt_delta(m.rework_pct, p.get('rework_pct'), unit='pp', lower_is_better=True)}"
+             " — changes that FIXED an earlier one (no overlap with the line above)")
+    human_pct = None if m.agent_authored_pct is None else round(100.0 - m.agent_authored_pct, 1)
+    L.append(f"• *Authored:* {'n/a' if m.agent_authored_pct is None else f'{m.agent_authored_pct:g}% agent'}"
              f"{_fmt_delta(m.agent_authored_pct, p.get('agent_authored_pct'), unit='pp', lower_is_better=False)}"
-             " — context, not a score")
+             + ("" if human_pct is None else f" · {human_pct:g}% human")
+             + " — by the `agent-authored` attestation on the PR; context, not a score")
     L.append(f"• *Human Attention / Change:* {_hours(m.human_touch_median_h)} median"
              f"{_fmt_delta(m.human_touch_median_h, p.get('human_touch_median_h'), unit='pct', lower_is_better=True)}"
-             f" · {'n/a' if m.human_touches_per_change is None else f'{m.human_touches_per_change:g}'} human touches each")
-    L.append(f"• *Review latency:* {_hours(m.review_latency_median_h)} to first human touch"
+             f" · {'n/a' if m.human_touches_per_change is None else f'{m.human_touches_per_change:g}'} human vs "
+             f"{'n/a' if m.agent_touches_per_change is None else f'{m.agent_touches_per_change:g}'} agent touches per change")
+    L.append(f"• *Time to first review:* {_hours(m.review_latency_median_h)}"
              f"{_fmt_delta(m.review_latency_median_h, p.get('review_latency_median_h'), unit='pct', lower_is_better=True)}")
     L.append(f"• *First-pass Agent Success:* {'n/a' if m.first_pass_agent_pct is None else f'{m.first_pass_agent_pct:g}%'}"
              f"{_fmt_delta(m.first_pass_agent_pct, p.get('first_pass_agent_pct'), unit='pp', lower_is_better=False)}"
@@ -344,8 +412,19 @@ def render(m: EngineeringMetrics, prev: dict[str, Any] | None = None) -> str:
              f"{'n/a' if m.blocking_findings_per_change is None else f'{m.blocking_findings_per_change:g}'}"
              f"{_fmt_delta(m.blocking_findings_per_change, p.get('blocking_findings_per_change'), unit='pct', lower_is_better=True)}"
              " — P0–P2 only; P3 does not gate")
-    L.append("• *AI Cost / Shipped Change:* _not instrumented_ — needs a per-run token ledger "
-             "from the gateway; nothing in this estate records it yet")
+    if m.paid_spend_week is not None and m.merged:
+        per = m.paid_spend_week / m.merged
+        L.append(f"• *Paid-tool cost / change:* {m.spend_currency} {per:,.2f}"
+                 f" — {m.spend_currency} {m.paid_spend_week:,.0f}/week across Claude, Cursor, "
+                 f"frontier APIs, GitHub Actions and cubic, over {m.merged} changes")
+    else:
+        L.append("• *Paid-tool cost / change:* _not configured_ — set "
+                 "`SUSAN_TOOL_SPEND_MONTHLY` (e.g. `claude=1200,cursor=180,cubic=400,"
+                 "github-actions=300`) and this divides the week's paid spend by what shipped")
+    L.append(f"• *Reviewed on paid tooling:* "
+             f"{'n/a' if m.paid_reviewed_pct is None else f'{m.paid_reviewed_pct:g}%'}"
+             f"{_fmt_delta(m.paid_reviewed_pct, p.get('paid_reviewed_pct'), unit='pp', lower_is_better=True)}"
+             " — the rest was reviewed on our own models")
     L.append(f"• *Flow:* {m.open_backlog} open, {m.stale_open} older than {m.stale_days}d")
 
     if m.signals_covered and m.merged and m.signals_covered < m.merged:

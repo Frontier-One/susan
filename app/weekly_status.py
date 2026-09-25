@@ -398,6 +398,7 @@ async def process_weekly_status(
 
             em = compute_engineering_metrics(
                 all_merged, all_opened, repos=len(per_repo), signals=signals,
+                per_repo=[(r, len(mg)) for r, mg, _o, _d in per_repo],
                 window_days=max(1, (
                     _dt.date.fromisoformat(until_d) - _dt.date.fromisoformat(since_d)
                 ).days + 1),

@@ -175,6 +175,7 @@ the proposed field values go into the issue body for a human to set.
 | `DEFAULT_EMAIL_TO` | Optional | Fallback when draft has no To: line |
 | `SLACK_USER_EMAIL_MAP` | Optional | `U123:a@b.com,…` or JSON map when Slack hides emails |
 | `SUSAN_WEEKLY_AUTO_POST_USER_IDS` | Optional | Comma Slack user IDs allowed to use `--no-approval` on weekly status |
+| `SUSAN_TOOL_SPEND_MONTHLY` | Optional | Paid-tooling spend as `name=amount` pairs, e.g. `claude=1200,cursor=180,cubic=400,github-actions=300`. Converted to a week at 7/30.44 and divided by what shipped, to give *Paid-tool cost / change*. Unset = the line says it is not configured rather than printing a zero. `SUSAN_TOOL_SPEND_WEEKLY` for anything billed weekly, `SUSAN_TOOL_SPEND_CURRENCY` to change from GBP. |
 | `SUSAN_WEEKLY_EXTRA_CHANNELS` | Optional | Channel ids the weekly reads **in addition** to its own, comma-separated. Default is `#team-tech-standups,#team-tech-reviews` — the written standups and the review channel carry blockers and design decisions that never reach the main channel. Set to an empty string to read only the invoking channel. |
 | `SUSAN_STATUS_PAGE_TOKEN` | Required for `status page` | Shared secret in the page URL (`?k=…`). Without it the route is a 404 and the command refuses: the page carries codewords and private addresses. |
 | `SUSAN_STATUS_PAGE_LOOKBACK_DAYS` | Optional | Days of alert-channel traffic and roadmap issues fed to the narrative (default 7). |
