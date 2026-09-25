@@ -68,3 +68,38 @@ def resolve_model(*, action: str | None = None, model_route: str | None = None) 
             return sovereign
         return default_model
     return default_model
+
+
+# ── per-action sovereign endpoint (2026-09-25) ────────────────────────────────────────
+# Not every task wants the same self-hosted model. The weekly update is long-context
+# synthesis and reads better on GLM-5.3-Flash; the digests are fine on the default.
+# Two env vars, both `action=value` pairs, so a task can be moved without a deploy:
+#
+#   SUSAN_ACTION_MODELS="weekly_status=glm-5.3-flash,status_page=glm-5.3-flash"
+#   SUSAN_ACTION_MODEL_BASE_URLS="weekly_status=https://glm.frontierone.dev/v1"
+#
+# A base URL is usually needed WITH the model: our models sit behind per-model gateways,
+# so naming a model the default endpoint does not serve is a 404, not a fallback. When
+# only the model is overridden the default endpoint is used and that is the caller's
+# problem to get right.
+
+
+def _action_map(var: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for pair in (os.environ.get(var) or "").split(","):
+        if "=" not in pair:
+            continue
+        k, _, v = pair.partition("=")
+        if k.strip() and v.strip():
+            out[k.strip()] = v.strip()
+    return out
+
+
+def sovereign_override(action: str | None) -> tuple[str | None, str | None]:
+    """(model, base_url) for this action, or (None, None) to use the defaults."""
+    if not action:
+        return None, None
+    return (
+        _action_map("SUSAN_ACTION_MODELS").get(action),
+        _action_map("SUSAN_ACTION_MODEL_BASE_URLS").get(action),
+    )
