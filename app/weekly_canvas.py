@@ -52,10 +52,10 @@ def _canvas_structure(text: str) -> str:
     than a heading: the Canvas already carries an H1 title, and two headings stacked on
     top of each other read as a mistake.
     """
+    lines = [raw.rstrip() for raw in (text or "").splitlines()]
     out: list[str] = []
     seen_content = False
-    for raw in (text or "").splitlines():
-        line = raw.rstrip()
+    for idx, line in enumerate(lines):
         if not line.strip():
             out.append("")
             continue
@@ -81,8 +81,13 @@ def _canvas_structure(text: str) -> str:
         if m:
             head = m.group(1).strip()
             tail = (m.group(2) if m.lastindex and m.lastindex >= 2 else "").rstrip()
-            if not seen_content:
-                # Standfirst under the H1, not a second title.
+            # A standfirst, not a second title — but ONLY when it looks like one: the
+            # update opens with a bold title line followed by a BLANK line, then the
+            # sections. A body that opens straight into a section (bold line, then its
+            # bullets) keeps its heading, or the first section of every such update
+            # would silently lose its structure.
+            nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
+            if not seen_content and not nxt.strip():
                 out.append(f"_{head}{tail}_")
             else:
                 out.extend(["", f"## {head}{tail}", ""])
