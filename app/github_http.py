@@ -7,6 +7,7 @@ import os
 import time
 import urllib.parse
 
+import re
 import httpx
 
 from app.config import logger
@@ -325,10 +326,41 @@ async def _github_list_all_pages(
     return out
 
 
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_SEVERITY_RE = re.compile(r"^[\s>*_`#-]*(P[0-3])\b\s*:?", re.IGNORECASE)
+
+
+def finding_severity(body: str | None) -> str | None:
+    """`P0`-`P3` from the first real line of a review comment, else None.
+
+    Mirrors the Forseti approver's own rule: strip HTML comments (cubic leads with
+    several), take the first non-blank line, and allow the markdown decoration a
+    reviewer puts in front of the tag. Anything else is not a finding — a reply that
+    merely mentions "P1" mid-sentence must not be counted as one.
+    """
+    text = _HTML_COMMENT_RE.sub("", str(body or ""))
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        m = _SEVERITY_RE.match(line)
+        return m.group(1).upper() if m else None
+    return None
+
+
 async def fetch_pr_human_signals(repo: str, pr_number: int, token: str) -> dict:
     """Human-in-the-loop signals for ONE merged PR, for the AI-native metrics.
 
-    Returns ``{first_human_touch, human_touches, changes_requested, human_logins}``.
+    Returns ``{first_human_touch, human_touches, changes_requested, blocking_findings,
+    findings_by_severity, human_logins}``.
+
+    ``blocking_findings`` counts **P0/P1/P2** review findings from ANY reviewer — that
+    is what "changes requested" means in this estate. Our agentic reviewers post
+    findings as review comments rather than as a GitHub CHANGES_REQUESTED review, so
+    counting only the formal state reported a perfect first-pass rate on a week that
+    had plenty of findings. P3 is excluded deliberately: it does not gate a merge
+    (D-F23), so treating it as a change request would make the metric disagree with
+    the gate it is supposed to describe. Author-agnostic on purpose, so a second review
+    cycle from our own reviewer counts the same as cubic's.
     ``first_human_touch`` is the earliest timestamp a non-bot left a review or a comment —
     the moment a person's attention entered the change. Bots are excluded by the same
     `[bot]` / known-app test the participant helper uses, because a farm comment is not
@@ -336,7 +368,14 @@ async def fetch_pr_human_signals(repo: str, pr_number: int, token: str) -> dict:
     """
     hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     base = f"https://api.github.com/repos/{repo}"
-    out = {"first_human_touch": None, "human_touches": 0, "changes_requested": 0, "human_logins": set()}
+    out = {
+        "first_human_touch": None,
+        "human_touches": 0,
+        "changes_requested": 0,
+        "blocking_findings": 0,
+        "findings_by_severity": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+        "human_logins": set(),
+    }
     async with _PR_SUMMARY_PARTICIPANT_SEM:
         async with httpx.AsyncClient(timeout=45) as client:
             for url, is_review in (
@@ -352,6 +391,11 @@ async def fetch_pr_human_signals(repo: str, pr_number: int, token: str) -> dict:
                 for it in items:
                     if not isinstance(it, dict):
                         continue
+                    sev = finding_severity(it.get("body"))
+                    if sev:
+                        out["findings_by_severity"][sev] += 1
+                        if sev in ("P0", "P1", "P2"):
+                            out["blocking_findings"] += 1
                     user = (it.get("user") or {})
                     login = str(user.get("login") or "")
                     if not login or user.get("type") == "Bot" or login.endswith("[bot]"):
