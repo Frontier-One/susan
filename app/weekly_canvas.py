@@ -7,6 +7,7 @@ import re
 from app.config import logger
 from app.slack_api import (
     post_message,
+    slack_user_display_name,
     post_pr_summary_to_channel,
     slack_api_canvases_create,
     slack_api_files_permalink,
@@ -38,10 +39,61 @@ def weekly_status_use_canvas() -> bool:
 _SECTION_WITH_TAIL_RE = re.compile(r"^\*([^*\n]+)\*(\s*(?:[—–-]|\().*)$")
 # `*Decisions*` — the whole line is one bold run.
 _SECTION_BARE_RE = re.compile(r"^\*([^*\n]+)\*[ \t]*$")
-# `• text`, `- text`, `· text`, optionally indented one level.
-_BULLET_RE = re.compile(r"^(\s*)[•·‣▪][ \t]+(.*)$")
+# `• text`, `· text`, optionally indented — and a RUN of them. The model sometimes
+# emits `• • text` (it copies the bullet from the prompt's example and adds its own),
+# which used to render as a native list bullet FOLLOWED by a literal •.
+_BULLET_RE = re.compile(r"^(\s*)(?:[•·‣▪][ \t]*)+(.*)$")
+# `Next: …`, `Blocked / at risk: …` at the start of a list item. The update's own
+# structure puts a label there, and the model drops the emphasis about half the time;
+# bolding it here makes the shape consistent instead of depending on the model.
+_ITEM_LABEL_RE = re.compile(r"^((?:\*\*)?)([A-Z][A-Za-z][A-Za-z /&'-]{0,28}?)(:)(?:\s|$)")
+# Slack renders <@U123> as a mention; a Canvas does not, and shows the raw id.
+_SLACK_MENTION_RE = re.compile(r"<@(U[A-Z0-9]{6,})(?:\|([^>]*))?>")
 # The update's closing line: `Decisions this week: a; b; c`.
 _DECISIONS_RE = re.compile(r"^(decisions(?:\s+this\s+week)?)\s*:\s*(.+)$", re.IGNORECASE)
+
+
+def _bold_leading_label(item: str) -> str:
+    """`Next: x` -> `**Next:** x`. Leaves an already-emphasised label alone."""
+    if item.startswith("**") or item.startswith("*"):
+        return item
+    m = _ITEM_LABEL_RE.match(item)
+    if not m:
+        return item
+    label = m.group(2)
+    rest = item[m.end(3):].lstrip()
+    return f"**{label}:** {rest}" if rest else f"**{label}:**"
+
+
+def resolve_slack_mentions(text: str, names: dict[str, str] | None) -> str:
+    """`<@U123>` -> `@Name`, because a Canvas shows the raw id otherwise.
+
+    With no name for an id, the token is DROPPED rather than printed: the line
+    already carries a readable handle beside it (`— <@U…> @sgorelik`), and a raw
+    `U0ANAC8FBQ8` in a founder-facing page is worse than nothing. A trailing
+    separator left behind by the drop is cleaned up.
+    """
+    names = {k.upper(): v for k, v in (names or {}).items()}
+
+    def sub(m: re.Match[str]) -> str:
+        label = names.get(m.group(1).upper()) or (m.group(2) or "").strip()
+        return f"@{label.lstrip('@')}" if label else ""
+
+    out = _SLACK_MENTION_RE.sub(sub, text)
+    # "— , @x" / "—  @x" left by a dropped token
+    out = re.sub(r"(—|-)\s*,\s*", r"\1 ", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return re.sub(r"(—|-) +$", "", out, flags=re.MULTILINE).rstrip()
+
+
+def slack_mention_ids(text: str) -> list[str]:
+    """Every distinct U… id the body mentions, so the caller can resolve them once."""
+    seen: list[str] = []
+    for m in _SLACK_MENTION_RE.finditer(text or ""):
+        uid = m.group(1).upper()
+        if uid not in seen:
+            seen.append(uid)
+    return seen
 
 
 def _canvas_structure(text: str) -> str:
@@ -63,13 +115,17 @@ def _canvas_structure(text: str) -> str:
         m = _BULLET_RE.match(line)
         if m:
             indent = "  " if m.group(1) else ""
-            out.append(f"{indent}- {m.group(2).strip()}")
+            out.append(f"{indent}- {_bold_leading_label(m.group(2).strip())}")
             seen_content = True
             continue
 
         m = _DECISIONS_RE.match(line.strip())
         if m:
-            items = [i.strip(" .;") for i in re.split(r";\s*", m.group(2)) if i.strip(" .;")]
+            body = m.group(2).strip()
+            # Semicolons are the update's own separator; fall back to sentences so a
+            # decisions paragraph still becomes a list instead of one long bullet.
+            parts = re.split(r";\s*", body) if ";" in body else re.split(r"(?<=[.!?])\s+(?=[A-Z])", body)
+            items = [i.strip(" .;") for i in parts if i.strip(" .;")]
             if items:
                 head = m.group(1).strip()
                 out.extend(["", f"## {head[:1].upper()}{head[1:]}", ""])
@@ -99,11 +155,12 @@ def _canvas_structure(text: str) -> str:
     return "\n".join(out)
 
 
-def slack_mrkdwn_to_canvas_markdown(text: str) -> str:
-    """Slack mrkdwn → Canvas markdown: structure first, then inline links and bold."""
+def slack_mrkdwn_to_canvas_markdown(text: str, names: dict[str, str] | None = None) -> str:
+    """Slack mrkdwn → Canvas markdown: mentions, then structure, then inline links/bold."""
     s = (text or "").strip()
     if not s:
         return ""
+    s = resolve_slack_mentions(s, names)
 
     def link_sub(m: re.Match[str]) -> str:
         return f"[{m.group(2).strip()}]({m.group(1).strip()})"
@@ -117,8 +174,8 @@ def slack_mrkdwn_to_canvas_markdown(text: str) -> str:
     return s.strip()
 
 
-def _canvas_document_markdown(title: str, body: str) -> str:
-    converted = slack_mrkdwn_to_canvas_markdown(body)
+def _canvas_document_markdown(title: str, body: str, names: dict[str, str] | None = None) -> str:
+    converted = slack_mrkdwn_to_canvas_markdown(body, names)
     title_line = (title or "Weekly status").strip()
     parts = [f"# {title_line}", "", converted, "", "---", "_Posted via Susan_"]
     return "\n".join(p for p in parts if p is not None)
@@ -164,7 +221,13 @@ async def _publish_weekly_status_to_canvas(
     model_route: str | None = None,
     model_name: str | None = None,
 ) -> None:
-    markdown = _canvas_document_markdown(title, body)
+    names: dict[str, str] = {}
+    for uid in slack_mention_ids(body):
+        try:
+            names[uid] = await slack_user_display_name(uid)
+        except Exception as e:  # a name is cosmetic; never fail the publish for one
+            logger.warning("canvas: could not resolve %s: %s", uid, e)
+    markdown = _canvas_document_markdown(title, body, names)
     canvas_id = await slack_api_canvases_create(
         title=(title or "Weekly status")[:150],
         markdown=markdown,

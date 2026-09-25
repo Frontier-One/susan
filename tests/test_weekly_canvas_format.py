@@ -66,3 +66,60 @@ def test_document_has_one_h1_and_the_footer() -> None:
 def test_empty_body_is_empty_not_an_exception() -> None:
     assert slack_mrkdwn_to_canvas_markdown("") == ""
     assert slack_mrkdwn_to_canvas_markdown("   \n\n ") == ""
+
+
+# ── reported from a live Canvas, 2026-09-25 ───────────────────────────────────────────
+
+
+def test_a_run_of_bullet_characters_becomes_ONE_list_item() -> None:
+    """The model emits `• • text`; that rendered as a native bullet then a literal •."""
+    out = slack_mrkdwn_to_canvas_markdown("lead\n\n*T* — x\n• • did the thing")
+    assert "- did the thing" in out
+    assert "•" not in out
+
+
+def test_a_leading_label_on_an_item_is_bolded() -> None:
+    out = slack_mrkdwn_to_canvas_markdown("lead\n\n*T* — x\n• Next: flip the gates\n• Blocked / at risk: a review")
+    assert "- **Next:** flip the gates" in out
+    assert "- **Blocked / at risk:** a review" in out
+
+
+def test_an_already_emphasised_label_is_left_alone() -> None:
+    out = slack_mrkdwn_to_canvas_markdown("lead\n\n*T* — x\n• *Shipped:* a thing")
+    assert "- **Shipped:** a thing" in out
+    assert "****" not in out
+
+
+def test_a_sentence_starting_with_a_capital_is_not_mistaken_for_a_label() -> None:
+    out = slack_mrkdwn_to_canvas_markdown("lead\n\n*T* — x\n• Gavin shipped the thing today")
+    assert "- Gavin shipped the thing today" in out
+    assert "**" not in out
+
+
+def test_slack_mentions_resolve_to_names_and_raw_ids_never_survive() -> None:
+    src = "lead\n\n*Review pipeline* — <@U0ANAC8FBQ8> @sgorelik\n• <@U0BUW8PN5E3> owns it"
+    out = slack_mrkdwn_to_canvas_markdown(src, {"U0ANAC8FBQ8": "Stacy", "U0BUW8PN5E3": "Gavin"})
+    assert "@Stacy" in out and "@Gavin" in out
+    assert "U0ANAC8FBQ8" not in out and "<@" not in out
+
+
+def test_an_unresolvable_mention_is_dropped_not_printed_raw() -> None:
+    """A bare U0… id in a founder-facing page is worse than nothing; a handle is beside it."""
+    out = slack_mrkdwn_to_canvas_markdown("lead\n\n*T* — <@U0UNKNOWN9> @sgorelik\n• x", {})
+    assert "U0UNKNOWN9" not in out
+    assert "@sgorelik" in out
+
+
+def test_mention_ids_are_listed_once_each_for_the_caller_to_resolve() -> None:
+    from app.weekly_canvas import slack_mention_ids
+
+    assert slack_mention_ids("<@U1AAAAAAA> a <@U2BBBBBBB> b <@U1AAAAAAA>") == ["U1AAAAAAA", "U2BBBBBBB"]
+
+
+def test_decisions_paragraph_without_semicolons_still_becomes_a_list() -> None:
+    out = slack_mrkdwn_to_canvas_markdown(
+        "lead\n\nDecisions this week: We moved to vCluster. Standup goes async-first."
+    )
+    assert "## Decisions this week" in out
+    assert "- We moved to vCluster" in out
+    assert "- Standup goes async-first" in out

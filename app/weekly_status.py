@@ -8,7 +8,14 @@ import os
 from collections import Counter
 from inspect import cleandoc
 
-from db import create_user_draft, get_github_token, previous_metric_snapshot, upsert_metric_snapshot
+from db import (
+    create_user_draft,
+    get_github_token,
+    get_granola_token,
+    previous_metric_snapshot,
+    upsert_metric_snapshot,
+    user_has_granola_tokens,
+)
 
 from app.claude_client import ModelCompletion, call_claude
 from app.config import ACTIONS, SUSAN_VOICE, logger
@@ -24,6 +31,7 @@ from app.slack_api import (
     slack_channel_bookmarks_for_weekly,
 )
 from app.engineering_metrics import compute as compute_engineering_metrics
+from app.granola_summarize import collect_granola_notes_for_window
 from app.engineering_metrics import render as render_engineering_metrics
 from app.weekly_canvas import publish_weekly_status
 from app.weekly_context import parse_weekly_status_time_range, utc_date_start_slack_ts
@@ -73,8 +81,24 @@ _WEEKLY_STRUCTURE = cleandoc(
       • *Blocked / at risk:* one bullet, only if real, naming who or what it waits on.
       • *Next:* one bullet, the single most important thing, with an owner.
 
-    - Then one closing line, *Decisions this week:* — the decisions taken, semicolon-
-      separated, each with who took it. Omit the line if there were none.
+    - Then *Decisions this week:* — semicolon-separated, each with who took it. This
+      section is rendered as its own list, so put every decision in it and nowhere else.
+
+      *Gather decisions from ALL FOUR sources, not just Slack:*
+      1. **Meetings** — the Granola summaries block. Standups and team calls are where
+         most decisions are actually taken, and they are usually stated once and never
+         written down anywhere else. Read every meeting in the window, not just standup.
+      2. **Slack** — a clear decision point in the transcript: someone says what will
+         happen and nobody reopens it. Not a proposal, not a question, not a preference.
+      3. **GitHub** — a merged PR or issue that RECORDS a decision: a decision-register
+         entry (`D-F<n>`, `D-<name><n>`), a title or body saying *decided / DECIDED /
+         we will / operator decision*, a policy or `docs/plans/**` change that settles
+         an open question. A routine feature merge is not a decision.
+      4. **The roadmap board** — an item moved to a decided state, or a decision issue.
+
+      Rules: one line each, the decision then who took it. Deduplicate across sources —
+      a decision taken in standup and then merged as a PR is ONE decision, cite the PR.
+      Omit the section entirely if there were none; never write "none recorded".
 
     - Hard limits: **350–550 words total**, no more than 12 bullets across the whole
       update, no section longer than 5 lines. If you are over, cut the least
@@ -87,6 +111,16 @@ _WEEKLY_STRUCTURE = cleandoc(
     - Close with nothing that says the message is a private draft or ephemeral.
     """
 )
+
+
+def _weekly_meeting_cap() -> int:
+    n = int((os.environ.get("WEEKLY_STATUS_MAX_MEETINGS") or "12").strip() or "12")
+    return max(1, min(40, n))
+
+
+def _weekly_meeting_chars() -> int:
+    n = int((os.environ.get("WEEKLY_STATUS_MEETING_CHARS") or "2500").strip() or "2500")
+    return max(400, min(20_000, n))
 
 
 def _weekly_status_title_line(
@@ -138,6 +172,35 @@ async def process_weekly_status(
     bookmark_section = f"\n---\n{bookmark_md}\n" if bookmark_md else ""
     # Set by the GitHub branch below; the Slack-only branch has no PR data to count.
     metrics_block = ""
+
+    # ── meetings: where decisions are actually taken ───────────────────────────────
+    # The weekly read Slack, GitHub and Drive and NOT Granola, so "Decisions" was only
+    # as good as whatever happened to be typed in a channel. Standups and team calls
+    # are where most of them are made, so the whole window's meetings go in — not just
+    # the standup. Best-effort: no Granola, no block, and the update still runs.
+    meetings_block = ""
+    try:
+        if await user_has_granola_tokens(user):
+            notes = await collect_granola_notes_for_window(
+                await get_granola_token(user), since_d, until_d
+            )
+            if notes:
+                parts = []
+                for n in notes[: _weekly_meeting_cap()]:
+                    body = (n.get("summary_markdown") or n.get("summary_text") or "").strip()
+                    if not body:
+                        continue
+                    parts.append(
+                        f"#### {n.get('title') or '(untitled)'} — {(n.get('created_at') or '')[:10]}\n"
+                        f"{body[: _weekly_meeting_chars()]}"
+                    )
+                if parts:
+                    meetings_block = (
+                        "\n---\n### Meetings this window (Granola summaries — a primary "
+                        "source for Decisions)\n" + "\n\n".join(parts) + "\n"
+                    )
+    except Exception as e:
+        logger.warning("Weekly status Granola meetings unavailable: %s", e)
 
     if include_github:
         if not repos:
@@ -270,6 +333,7 @@ async def process_weekly_status(
             f"{bookmark_section}"
             f"---\n### GitHub (all configured repos for this weekly run)\n{facts}"
             f"{drive_block}"
+            f"{meetings_block}"
         )
         system = "\n\n".join(
             [
@@ -303,6 +367,7 @@ async def process_weekly_status(
             f"---\n### Slack transcript\n{slack_digest}\n"
             f"{bookmark_section}"
             f"{drive_block}"
+            f"{meetings_block}"
         )
         system = "\n\n".join(
             [
