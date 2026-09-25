@@ -93,13 +93,45 @@ def test_empty_window_reports_nothing_rather_than_zeroes_that_read_as_facts() ->
     assert "n/a" in out
 
 
-def test_render_shows_throughput_and_rework_together() -> None:
+def test_render_shows_throughput_with_its_failure_signals() -> None:
     """DORA's warning: deployment frequency without change failure rate masks risk."""
     out = render(compute([pr(), pr(title="fix(a): b")], [], repos=2, now=NOW))
-    assert "PRs merged" in out
-    assert "Rework:" in out
+    assert "*Shipped:*" in out
+    assert "*Change Failure:*" in out and "*Rework:*" in out
     assert "not a score" in out          # the AI-share vanity-metric caveat
-    assert "proxy" in out.lower()        # lead time and rework are both labelled
+    assert "proxies" in out.lower()      # Intent→Prod and Human Attention are labelled
+
+
+def test_an_uninstrumented_metric_says_so_by_name() -> None:
+    """Omitting it would read as 'nothing to report' for something simply not measured."""
+    out = render(compute([pr()], [], now=NOW))
+    assert "AI Cost / Shipped Change" in out and "not instrumented" in out
+
+
+def test_percentage_metrics_move_in_POINTS_not_relative_percent() -> None:
+    """5% -> 7% rework moved two POINTS; reporting +40% is how a drift reads as a crisis."""
+    now_m = EngineeringMetrics(iso_week=39, merged=10, rework_pct=7.0)
+    out = render(now_m, {"merged": 10, "rework_pct": 5.0})
+    assert "2pp" in out and "40%" not in out
+
+
+def test_an_adverse_move_is_flagged_and_a_good_one_is_not() -> None:
+    out = render(EngineeringMetrics(iso_week=39, merged=10, rework_pct=7.0, change_failure_pct=2.0),
+                 {"merged": 10, "rework_pct": 5.0, "change_failure_pct": 4.0})
+    rework = [x for x in out.splitlines() if x.startswith("*Rework:*")][0]
+    failure = [x for x in out.splitlines() if x.startswith("*Change Failure:*")][0]
+    assert "⚠️" in rework and "⚠️" not in failure
+
+
+def test_human_attention_covers_what_it_could_read_and_says_so() -> None:
+    merged = [pr(), pr(), pr()]
+    for i, x in enumerate(merged):
+        x["number"] = i + 1
+        x["repository_url"] = "https://api.github.com/repos/o/r"
+    sig = {"o/r#1": {"first_human_touch": merged[0]["created_at"], "human_touches": 2, "changes_requested": 0}}
+    m = compute(merged, [], signals=sig, now=NOW)
+    assert m.signals_covered == 1
+    assert "cover 1 of 3" in render(m)
 
 
 def test_render_never_names_a_person() -> None:
@@ -113,12 +145,12 @@ def test_render_never_names_a_person() -> None:
 
 
 def test_trend_deltas_point_the_right_way() -> None:
-    now_m = EngineeringMetrics(merged=20, lead_time_median_h=4.0, rework_pct=10.0)
+    now_m = EngineeringMetrics(iso_week=39, merged=20, lead_time_median_h=4.0, rework_pct=10.0)
     prev = {"merged": 15, "lead_time_median_h": 9.0, "rework_pct": 4.0}
     out = render(now_m, prev)
-    assert "(+5 ↑)" in out          # more merged is better
-    assert "(-5 ↑)" in out          # faster lead time is better
-    assert "(+6 ↓)" in out          # more rework is worse
+    assert "↑33%" in out            # 15 -> 20 merged, and more is better
+    assert "↓56%" in out            # 9h -> 4h lead time, faster is better
+    assert "↑6pp ⚠️" in out         # 4% -> 10% rework, worse
 
 
 def test_no_previous_snapshot_means_no_invented_trend() -> None:
