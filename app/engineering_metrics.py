@@ -146,7 +146,8 @@ class EngineeringMetrics:
     review_latency_median_h: float | None = None      # open -> a human first touches it
     human_touch_median_h: float | None = None         # first human touch -> merge
     human_touches_per_change: float | None = None
-    first_pass_agent_pct: float | None = None         # agent PRs merged with no changes-requested
+    first_pass_agent_pct: float | None = None         # agent PRs merged with no P0/P1/P2 finding
+    blocking_findings_per_change: float | None = None
     signals_covered: int = 0                          # PRs we could read review data for
     notes: list[str] = field(default_factory=list)
 
@@ -167,6 +168,7 @@ class EngineeringMetrics:
             "human_touch_median_h": self.human_touch_median_h,
             "human_touches_per_change": self.human_touches_per_change,
             "first_pass_agent_pct": self.first_pass_agent_pct,
+            "blocking_findings_per_change": self.blocking_findings_per_change,
         }
 
 
@@ -224,7 +226,7 @@ def compute(
 
     # ── human-in-the-loop, only where we could read the reviews ──
     if signals:
-        lat, touch, touches = [], [], []
+        lat, touch, touches, findings = [], [], [], []
         agent_total = agent_clean = 0
         covered = 0
         for p in merged:
@@ -237,13 +239,19 @@ def compute(
             mg = _iso((p.get("pull_request") or {}).get("merged_at"))
             first = _iso(sig.get("first_human_touch"))
             touches.append(int(sig.get("human_touches") or 0))
+            blocking = int(sig.get("blocking_findings") or 0)
+            findings.append(blocking)
             if c and first and first >= c:
                 lat.append((first - c).total_seconds() / 3600.0)
             if first and mg and mg >= first:
                 touch.append((mg - first).total_seconds() / 3600.0)
             if is_agent_authored(p):
                 agent_total += 1
-                if not int(sig.get("changes_requested") or 0):
+                # First pass = the reviewers found nothing that GATES a merge. A
+                # formal CHANGES_REQUESTED counts, and so does any P0/P1/P2 finding,
+                # because that is what our reviewers actually emit. P3 does not gate
+                # (D-F23) and so does not spoil a first pass.
+                if not blocking and not int(sig.get("changes_requested") or 0):
                     agent_clean += 1
         m.signals_covered = covered
         if lat:
@@ -252,6 +260,8 @@ def compute(
             m.human_touch_median_h = round(statistics.median(touch), 1)
         if touches:
             m.human_touches_per_change = round(statistics.mean(touches), 1)
+        if findings:
+            m.blocking_findings_per_change = round(statistics.mean(findings), 1)
         if agent_total:
             m.first_pass_agent_pct = _pct(agent_clean, agent_total)
     return m
@@ -329,7 +339,11 @@ def render(m: EngineeringMetrics, prev: dict[str, Any] | None = None) -> str:
              f"{_fmt_delta(m.review_latency_median_h, p.get('review_latency_median_h'), unit='pct', lower_is_better=True)}")
     L.append(f"• *First-pass Agent Success:* {'n/a' if m.first_pass_agent_pct is None else f'{m.first_pass_agent_pct:g}%'}"
              f"{_fmt_delta(m.first_pass_agent_pct, p.get('first_pass_agent_pct'), unit='pp', lower_is_better=False)}"
-             " — agent PRs merged with no changes requested")
+             " — agent PRs merged with no P0/P1/P2 finding")
+    L.append(f"• *Blocking findings / change:* "
+             f"{'n/a' if m.blocking_findings_per_change is None else f'{m.blocking_findings_per_change:g}'}"
+             f"{_fmt_delta(m.blocking_findings_per_change, p.get('blocking_findings_per_change'), unit='pct', lower_is_better=True)}"
+             " — P0–P2 only; P3 does not gate")
     L.append("• *AI Cost / Shipped Change:* _not instrumented_ — needs a per-run token ledger "
              "from the gateway; nothing in this estate records it yet")
     L.append(f"• *Flow:* {m.open_backlog} open, {m.stale_open} older than {m.stale_days}d")

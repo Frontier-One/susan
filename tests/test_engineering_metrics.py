@@ -180,3 +180,60 @@ def test_weekly_reads_the_standup_and_review_channels_too() -> None:
         assert weekly_extra_channel_ids() == ["C1", "C2"]
     finally:
         del os.environ["SUSAN_WEEKLY_EXTRA_CHANNELS"]
+
+
+# ── first-pass agent success, tightened 2026-09-25 ────────────────────────────────────
+# A formal CHANGES_REQUESTED review is rare here: our reviewers post findings as review
+# COMMENTS tagged P0–P3. Counting only the GitHub state reported 100% first-pass on a
+# week with plenty of findings. P0/P1/P2 gate a merge and so spoil a first pass; P3 does
+# not gate (D-F23) and so does not.
+
+
+def test_severity_is_read_from_the_first_real_line_only() -> None:
+    from app.github_http import finding_severity
+
+    assert finding_severity("<!-- cubic:v=1 -->\n<!-- meta -->\n\nP1: too late") == "P1"
+    assert finding_severity("**P2:** remote shells leave tokens") == "P2"
+    assert finding_severity("> P1: quoted") == "P1"
+    # A mention mid-sentence is not a finding.
+    assert finding_severity("I think this is a P1 problem") is None
+    assert finding_severity("Fixed in 592c753.") is None
+    assert finding_severity("") is None
+    assert finding_severity(None) is None
+
+
+def _agent_pr(n: int):
+    p = pr(labels=["agent-authored"])
+    p["number"] = n
+    p["repository_url"] = "https://api.github.com/repos/o/r"
+    return p
+
+
+def test_a_blocking_finding_spoils_a_first_pass_but_a_p3_does_not() -> None:
+    merged = [_agent_pr(1), _agent_pr(2), _agent_pr(3)]
+    signals = {
+        "o/r#1": {"first_human_touch": None, "human_touches": 0, "changes_requested": 0,
+                  "blocking_findings": 0},                     # clean
+        "o/r#2": {"first_human_touch": None, "human_touches": 0, "changes_requested": 0,
+                  "blocking_findings": 2},                     # two P0-P2 findings
+        "o/r#3": {"first_human_touch": None, "human_touches": 0, "changes_requested": 0,
+                  "blocking_findings": 0},                     # only P3s -> still first pass
+    }
+    m = compute(merged, [], signals=signals, now=NOW)
+    assert m.first_pass_agent_pct == pytest.approx(66.7, abs=0.1)
+    assert m.blocking_findings_per_change == pytest.approx(0.7, abs=0.1)
+
+
+def test_a_formal_changes_requested_still_counts() -> None:
+    merged = [_agent_pr(1)]
+    sig = {"o/r#1": {"first_human_touch": None, "human_touches": 1, "changes_requested": 1,
+                     "blocking_findings": 0}}
+    assert compute(merged, [], signals=sig, now=NOW).first_pass_agent_pct == 0.0
+
+
+def test_the_block_says_which_severities_gate() -> None:
+    m = compute([_agent_pr(1)], [], signals={"o/r#1": {"blocking_findings": 0, "changes_requested": 0,
+                                                       "human_touches": 0, "first_human_touch": None}}, now=NOW)
+    out = render(m)
+    assert "no P0/P1/P2 finding" in out
+    assert "P3 does not gate" in out
