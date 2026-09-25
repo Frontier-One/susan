@@ -325,6 +325,47 @@ async def _github_list_all_pages(
     return out
 
 
+async def fetch_pr_human_signals(repo: str, pr_number: int, token: str) -> dict:
+    """Human-in-the-loop signals for ONE merged PR, for the AI-native metrics.
+
+    Returns ``{first_human_touch, human_touches, changes_requested, human_logins}``.
+    ``first_human_touch`` is the earliest timestamp a non-bot left a review or a comment —
+    the moment a person's attention entered the change. Bots are excluded by the same
+    `[bot]` / known-app test the participant helper uses, because a farm comment is not
+    human attention and counting it is how this metric would flatter itself.
+    """
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    base = f"https://api.github.com/repos/{repo}"
+    out = {"first_human_touch": None, "human_touches": 0, "changes_requested": 0, "human_logins": set()}
+    async with _PR_SUMMARY_PARTICIPANT_SEM:
+        async with httpx.AsyncClient(timeout=45) as client:
+            for url, is_review in (
+                (f"{base}/issues/{pr_number}/comments", False),
+                (f"{base}/pulls/{pr_number}/comments", False),
+                (f"{base}/pulls/{pr_number}/reviews", True),
+            ):
+                try:
+                    items = await _github_list_all_pages(client, url, hdrs, max_pages=3)
+                except Exception as e:
+                    logger.warning("PR signals %s#%s %s: %s", repo, pr_number, url.rsplit("/", 1)[-1], e)
+                    continue
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    user = (it.get("user") or {})
+                    login = str(user.get("login") or "")
+                    if not login or user.get("type") == "Bot" or login.endswith("[bot]"):
+                        continue
+                    out["human_logins"].add(login)
+                    out["human_touches"] += 1
+                    ts = it.get("submitted_at") or it.get("created_at")
+                    if ts and (out["first_human_touch"] is None or ts < out["first_human_touch"]):
+                        out["first_human_touch"] = ts
+                    if is_review and str(it.get("state") or "").upper() == "CHANGES_REQUESTED":
+                        out["changes_requested"] += 1
+    return out
+
+
 async def fetch_merged_pr_participant_logins(repo: str, pr_number: int, token: str) -> set[str]:
     """Logins from issue comments, pull review comments, and submitted reviews (non-bot)."""
     hdrs = {

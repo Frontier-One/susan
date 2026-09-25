@@ -24,6 +24,7 @@ from app.github_http import (
     fetch_dependabot_alert_stats,
     fetch_merged_prs_for_repo_range,
     fetch_opened_prs_for_repo_range,
+    fetch_pr_human_signals,
 )
 from app.slack_api import (
     fetch_slack_channel_history_since,
@@ -32,6 +33,8 @@ from app.slack_api import (
 )
 from app.engineering_metrics import compute as compute_engineering_metrics
 from app.granola_summarize import collect_granola_notes_for_window
+from app.engineering_metrics import observations_prompt as metrics_observations_prompt
+from app.engineering_metrics import pr_key as _pr_key
 from app.engineering_metrics import render as render_engineering_metrics
 from app.weekly_canvas import publish_weekly_status
 from app.weekly_context import parse_weekly_status_time_range, utc_date_start_slack_ts
@@ -310,8 +313,28 @@ async def process_weekly_status(
         try:
             all_merged = [pr for _r, mg, _o, _d in per_repo for pr in mg]
             all_opened = [pr for _r, _m, op, _d in per_repo for pr in op]
+
+            # Human-in-the-loop signals need one extra read per merged PR, so they are
+            # bounded and best-effort: a PR we cannot read is simply not counted, and the
+            # block says how many of the merged set the figures actually cover. A metric
+            # computed over an unknown fraction is worse than one that names its fraction.
+            signals: dict[str, dict] = {}
+            cap = max(0, min(400, int(os.environ.get("WEEKLY_STATUS_MAX_SIGNAL_PRS", "150"))))
+            async def one_signal(repo: str, pr: dict) -> None:
+                key = _pr_key(pr)
+                num = pr.get("number")
+                if not key or num is None:
+                    return
+                try:
+                    signals[key] = await fetch_pr_human_signals(repo, int(num), token)
+                except Exception as e:
+                    logger.warning("PR signals %s#%s: %s", repo, num, e)
+            tasks = [one_signal(r, pr) for r, mg, _o, _d in per_repo for pr in mg][:cap]
+            if tasks:
+                await asyncio.gather(*tasks)
+
             em = compute_engineering_metrics(
-                all_merged, all_opened, repos=len(per_repo),
+                all_merged, all_opened, repos=len(per_repo), signals=signals,
                 window_days=max(1, (
                     _dt.date.fromisoformat(until_d) - _dt.date.fromisoformat(since_d)
                 ).days + 1),
@@ -334,6 +357,7 @@ async def process_weekly_status(
             f"---\n### GitHub (all configured repos for this weekly run)\n{facts}"
             f"{drive_block}"
             f"{meetings_block}"
+            + (f"\n---\n{metrics_observations_prompt(metrics_block)}\n" if metrics_block else "")
         )
         system = "\n\n".join(
             [
@@ -368,6 +392,7 @@ async def process_weekly_status(
             f"{bookmark_section}"
             f"{drive_block}"
             f"{meetings_block}"
+            + (f"\n---\n{metrics_observations_prompt(metrics_block)}\n" if metrics_block else "")
         )
         system = "\n\n".join(
             [
@@ -410,14 +435,20 @@ async def process_weekly_status(
     model_route = summary.model_route
     model_name = summary.model_name
     if metrics_block:
-        # APPENDED, never handed to the model. Giving it the block and asking for it
-        # back verbatim is one paraphrase away from a wrong number in a founder-facing
-        # update; appending is the only way the arithmetic is guaranteed to survive.
-        summary = ModelCompletion(
-            f"{str(summary).rstrip()}\n\n{metrics_block}",
-            model_route=model_route,
-            model_name=model_name,
+        # The authoritative block is INSERTED, never left to the model to reproduce —
+        # one paraphrase is one wrong number in a founder-facing update. The model is
+        # given it read-only and asked for three interpretation lines, which belong
+        # UNDER it, so the block goes in immediately before the first of them.
+        body = str(summary).rstrip()
+        cut = min(
+            (i for i in (body.find(mk) for mk in ("*What changed:*", "*Where we're losing time:*", "*Action:*")) if i != -1),
+            default=-1,
         )
+        if cut > 0:
+            body = f"{body[:cut].rstrip()}\n\n{metrics_block}\n\n{body[cut:].lstrip()}"
+        else:
+            body = f"{body}\n\n{metrics_block}"
+        summary = ModelCompletion(body, model_route=model_route, model_name=model_name)
     if auto_publish:
         try:
             await publish_weekly_status(
