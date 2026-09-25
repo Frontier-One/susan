@@ -247,3 +247,32 @@ async def test_published_page_round_trips_through_the_real_db_layer(tmp_path, mo
     await dbmod.upsert_published_page("env-2", "env-status", "T2", "<html>B</html>")
     assert (await dbmod.latest_published_page("env-status"))["slug"] == "env-2"
     assert await dbmod.get_published_page("nope") is None
+
+
+# ── narrative extraction, hardened 2026-09-25 ─────────────────────────────────────────
+# It parsed clean on GLM and failed on DeepSeek, which answered with the object wrapped
+# in prose — so the live page rendered facts-only twice. A model that gave us the
+# content and dressed it differently should not cost the page its narrative.
+
+
+def test_narrative_survives_prose_around_the_object() -> None:
+    n = sp.parse_narrative('Here is the status:\n\n{"standfirst": "ok", "blockers": [{"title": "t"}]}\n\nHope that helps.')
+    assert n is not None and n["standfirst"] == "ok" and len(n["blockers"]) == 1
+
+
+def test_narrative_survives_a_reasoning_scratchpad() -> None:
+    assert sp.parse_narrative('<think>weighing it up</think>{"standfirst": "ok"}')["standfirst"] == "ok"
+    assert sp.parse_narrative('<reasoning>hm</reasoning>\n{"standfirst": "b"}')["standfirst"] == "b"
+
+
+def test_braces_inside_strings_do_not_end_the_object() -> None:
+    n = sp.parse_narrative('{"standfirst": "nested {braces} in a \\"quote\\"", "environments": {"dev": "x"}}')
+    assert n["environments"] == {"dev": "x"}
+    assert "{braces}" in n["standfirst"]
+
+
+def test_no_object_at_all_is_still_None() -> None:
+    """The fallback must stay honest: no narrative means the page says so."""
+    assert sp.parse_narrative("I could not read the cluster.") is None
+    assert sp.parse_narrative("") is None
+    assert sp.parse_narrative("[1, 2, 3]") is None
