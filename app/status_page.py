@@ -244,14 +244,61 @@ def _narrative_system_prompt() -> str:
     )
 
 
+def _strip_reasoning(text: str) -> str:
+    """Drop a reasoning model's visible scratchpad before looking for JSON."""
+    return re.sub(r"<(think|thinking|reasoning)>.*?</\1>", "", text or "", flags=re.S | re.I)
+
+
+def _first_json_object(text: str) -> str | None:
+    """The first balanced {...} in the text, ignoring braces inside strings.
+
+    A reasoning model routinely answers with a sentence, then the object, then a
+    summary — `json.loads` on the whole reply fails and the page renders factsonly.
+    Brace matching (rather than a regex) is what makes a nested object survive.
+    """
+    start = text.find("{")
+    while start != -1:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        start = text.find("{", start + 1)
+    return None
+
+
 def parse_narrative(text: str) -> dict[str, Any] | None:
-    """Strict JSON, tolerant only of a stray fence. None when it does not parse."""
-    s = (text or "").strip()
-    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.S)
-    try:
-        d = json.loads(s)
-    except Exception:
-        return None
+    """The narrative object, however the model chose to wrap it. None if truly absent.
+
+    Tolerant on purpose: this ran clean on GLM and failed on DeepSeek, which answered
+    with the object surrounded by prose. A model that gave us the content and dressed
+    it differently should not cost the page its whole narrative.
+    """
+    s = _strip_reasoning(text or "").strip()
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.S).strip()
+    d = None
+    for candidate in (s, _first_json_object(s)):
+        if not candidate:
+            continue
+        try:
+            d = json.loads(candidate)
+            break
+        except Exception:
+            continue
     if not isinstance(d, dict):
         return None
     d.setdefault("standfirst", "")
@@ -552,7 +599,12 @@ async def process_status_page(
         model_name = getattr(completion, "model_name", None)
         model_route = getattr(completion, "model_route", None)
         if narrative is None:
-            logger.warning("status page: narrative did not parse as JSON; rendering facts only")
+            # Log what it actually said, truncated. "Did not parse" on its own is not
+            # diagnosable, and this failure has now cost two runs.
+            logger.warning(
+                "status page: narrative did not parse as JSON (model=%s); first 400 chars: %r",
+                getattr(completion, "model_name", "?"), str(completion)[:400],
+            )
     except Exception as e:
         logger.exception("status page: narrative failed: %s", e)
 
