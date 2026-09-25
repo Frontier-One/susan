@@ -304,43 +304,46 @@ def render(m: EngineeringMetrics, prev: dict[str, Any] | None = None) -> str:
     truth for something that is simply not instrumented yet.
     """
     p = prev or {}
-    L: list[str] = [f"*ENGINEERING — WEEK {m.iso_week}*" if m.iso_week else "*ENGINEERING*"]
+    # Each metric is its OWN bullet. A bare newline between `*Label:* value` lines is
+    # not a line break in markdown, so in a Canvas the whole block ran together as one
+    # paragraph (reported 2026-09-25). A bullet survives both renderers: Slack shows
+    # the •, and the Canvas converter turns it into a real list item.
+    L: list[str] = [f"*ENGINEERING — WEEK {m.iso_week}*" if m.iso_week else "*ENGINEERING*", ""]
 
-    L.append(f"*Shipped:* {m.merged} changes{_fmt_delta(m.merged, p.get('merged'), unit='pct', lower_is_better=False)}"
+    L.append(f"• *Shipped:* {m.merged} changes{_fmt_delta(m.merged, p.get('merged'), unit='pct', lower_is_better=False)}"
              + (f" across {m.repos} repos" if m.repos else ""))
-    L.append(f"*Intent → Prod:* {_hours(m.lead_time_median_h)} median"
+    L.append(f"• *Intent → Prod:* {_hours(m.lead_time_median_h)} median"
              f"{_fmt_delta(m.lead_time_median_h, p.get('lead_time_median_h'), unit='pct', lower_is_better=True)}"
              f" · p90 {_hours(m.lead_time_p90_h)}")
-    L.append(f"*Change Failure:* {'n/a' if m.change_failure_pct is None else f'{m.change_failure_pct:g}%'}"
+    L.append(f"• *Change Failure:* {'n/a' if m.change_failure_pct is None else f'{m.change_failure_pct:g}%'}"
              f"{_fmt_delta(m.change_failure_pct, p.get('change_failure_pct'), unit='pp', lower_is_better=True)}")
-    L.append(f"*Rework:* {'n/a' if m.rework_pct is None else f'{m.rework_pct:g}%'}"
+    L.append(f"• *Rework:* {'n/a' if m.rework_pct is None else f'{m.rework_pct:g}%'}"
              f"{_fmt_delta(m.rework_pct, p.get('rework_pct'), unit='pp', lower_is_better=True)}")
-    L.append(f"*Agent-executed:* {'n/a' if m.agent_authored_pct is None else f'{m.agent_authored_pct:g}%'}"
+    L.append(f"• *Agent-executed:* {'n/a' if m.agent_authored_pct is None else f'{m.agent_authored_pct:g}%'}"
              f"{_fmt_delta(m.agent_authored_pct, p.get('agent_authored_pct'), unit='pp', lower_is_better=False)}"
              " — context, not a score")
-    L.append(f"*Human Attention / Change:* {_hours(m.human_touch_median_h)} median"
+    L.append(f"• *Human Attention / Change:* {_hours(m.human_touch_median_h)} median"
              f"{_fmt_delta(m.human_touch_median_h, p.get('human_touch_median_h'), unit='pct', lower_is_better=True)}"
              f" · {'n/a' if m.human_touches_per_change is None else f'{m.human_touches_per_change:g}'} human touches each")
-    L.append(f"*Review latency:* {_hours(m.review_latency_median_h)} to first human touch"
+    L.append(f"• *Review latency:* {_hours(m.review_latency_median_h)} to first human touch"
              f"{_fmt_delta(m.review_latency_median_h, p.get('review_latency_median_h'), unit='pct', lower_is_better=True)}")
-    L.append(f"*First-pass Agent Success:* {'n/a' if m.first_pass_agent_pct is None else f'{m.first_pass_agent_pct:g}%'}"
+    L.append(f"• *First-pass Agent Success:* {'n/a' if m.first_pass_agent_pct is None else f'{m.first_pass_agent_pct:g}%'}"
              f"{_fmt_delta(m.first_pass_agent_pct, p.get('first_pass_agent_pct'), unit='pp', lower_is_better=False)}"
              " — agent PRs merged with no changes requested")
-    L.append("*AI Cost / Shipped Change:* _not instrumented_ — needs a per-run token ledger "
+    L.append("• *AI Cost / Shipped Change:* _not instrumented_ — needs a per-run token ledger "
              "from the gateway; nothing in this estate records it yet")
-    L.append(f"*Flow:* {m.open_backlog} open, {m.stale_open} older than {m.stale_days}d")
+    L.append(f"• *Flow:* {m.open_backlog} open, {m.stale_open} older than {m.stale_days}d")
 
     if m.signals_covered and m.merged and m.signals_covered < m.merged:
         m.notes.append(f"human-attention figures cover {m.signals_covered} of {m.merged} merged PRs "
                        "(the rest could not be read)")
     if m.notes:
-        L.append("_" + "; ".join(m.notes) + "_")
-    L.append(
+        L.extend(["", "_" + "; ".join(m.notes) + "_"])
+    L.extend(["", 
         "_Team-level only and deliberately not per person: delivery metrics applied to "
         "individuals reward split batches and inflated counts. Intent→Prod is PR open→merge, "
         "and Human Attention is ELAPSED time from a person's first touch to merge — both are "
-        "proxies, and neither measures time actually spent._"
-    )
+        "proxies, and neither measures time actually spent._"])
     return "\n".join(L)
 
 

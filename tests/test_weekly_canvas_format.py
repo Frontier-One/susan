@@ -123,3 +123,37 @@ def test_decisions_paragraph_without_semicolons_still_becomes_a_list() -> None:
     assert "## Decisions this week" in out
     assert "- We moved to vCluster" in out
     assert "- Standup goes async-first" in out
+
+
+def test_canvas_footer_names_the_model_that_wrote_it() -> None:
+    """The attribution rode the Slack message but not the Canvas, so moving the update
+    into a Canvas silently dropped which model wrote it."""
+    from app.weekly_canvas import _canvas_document_markdown as doc
+
+    out = doc("W39", "*T* — x\n• a", {}, model_route="sovereign", model_name="glm-5.3-flash")
+    assert "Secure Sovereign FrontierOne AI model (glm-5.3-flash)" in out
+    assert out.rstrip().endswith("Posted via Susan_")
+    # A commercial route keeps the plain footer.
+    assert "Sovereign" not in doc("W39", "x", {}, model_route="commercial", model_name="claude")
+
+
+def test_observation_lines_each_get_their_own_paragraph() -> None:
+    from app.weekly_status import _separate_observation_lines as sep
+
+    run_on = "*What changed:* a. *Where we're losing time:* b. *Action:* c."
+    out = sep(run_on)
+    for mk in ("*What changed:*", "*Where we're losing time:*", "*Action:*"):
+        assert f"\n\n{mk}" in out or out.startswith(mk)
+    # Idempotent — running it twice does not add more blank lines.
+    assert sep(out) == out
+
+
+def test_each_metric_is_its_own_list_item_in_the_canvas() -> None:
+    """A bare newline is not a line break, so the block arrived as one paragraph."""
+    from app.engineering_metrics import EngineeringMetrics, render
+
+    block = render(EngineeringMetrics(iso_week=39, merged=10, rework_pct=5.0))
+    out = slack_mrkdwn_to_canvas_markdown("lead\n\n" + block)
+    assert "- **Shipped:**" in out
+    assert "- **Rework:**" in out
+    assert "- **Flow:**" in out

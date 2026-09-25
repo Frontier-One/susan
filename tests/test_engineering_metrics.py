@@ -118,8 +118,8 @@ def test_percentage_metrics_move_in_POINTS_not_relative_percent() -> None:
 def test_an_adverse_move_is_flagged_and_a_good_one_is_not() -> None:
     out = render(EngineeringMetrics(iso_week=39, merged=10, rework_pct=7.0, change_failure_pct=2.0),
                  {"merged": 10, "rework_pct": 5.0, "change_failure_pct": 4.0})
-    rework = [x for x in out.splitlines() if x.startswith("*Rework:*")][0]
-    failure = [x for x in out.splitlines() if x.startswith("*Change Failure:*")][0]
+    rework = [x for x in out.splitlines() if x.startswith("• *Rework:*")][0]
+    failure = [x for x in out.splitlines() if x.startswith("• *Change Failure:*")][0]
     assert "⚠️" in rework and "⚠️" not in failure
 
 
