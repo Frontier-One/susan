@@ -87,7 +87,11 @@ _WEEKLY_STRUCTURE = cleandoc(
     - Then *Decisions this week:* — semicolon-separated, each with who took it. This
       section is rendered as its own list, so put every decision in it and nowhere else.
 
-      *Gather decisions from ALL FOUR sources, not just Slack:*
+      *Gather decisions from ALL of these, not just the main channel:*
+      0. **The other channels block** — the written standups and the review channel.
+         A blocker is usually first said in a standup post and a design argument is
+         usually settled in review; neither reaches the main channel. Attribute an item
+         to the room it was actually said in, not the one it was repeated in.
       1. **Meetings** — the Granola summaries block. Standups and team calls are where
          most decisions are actually taken, and they are usually stated once and never
          written down anywhere else. Read every meeting in the window, not just standup.
@@ -114,6 +118,26 @@ _WEEKLY_STRUCTURE = cleandoc(
     - Close with nothing that says the message is a private draft or ephemeral.
     """
 )
+
+
+# Channels the weekly reads IN ADDITION to the one it was invoked in (or scheduled to).
+# The written standups and the review channel carry work that never reaches #team-tech:
+# a standup post is where a blocker is first said out loud, and the review channel is
+# where a PR actually gets argued. Reading only the main channel made the update a
+# summary of what people happened to announce there.
+_WEEKLY_EXTRA_CHANNEL_DEFAULT = "C0C35UE399B,C0C2PJ99PKL"   # team-tech-standups, team-tech-reviews
+
+
+def weekly_extra_channel_ids(exclude: str = "") -> list[str]:
+    """Extra channel ids for the weekly, minus the one already being read."""
+    raw = os.environ.get("SUSAN_WEEKLY_EXTRA_CHANNELS")
+    raw = _WEEKLY_EXTRA_CHANNEL_DEFAULT if raw is None else raw
+    out: list[str] = []
+    for part in str(raw).split(","):
+        cid = part.strip()
+        if cid and cid != exclude and cid not in out:
+            out.append(cid)
+    return out
 
 
 def _weekly_meeting_cap() -> int:
@@ -175,6 +199,25 @@ async def process_weekly_status(
     bookmark_section = f"\n---\n{bookmark_md}\n" if bookmark_md else ""
     # Set by the GitHub branch below; the Slack-only branch has no PR data to count.
     metrics_block = ""
+
+    # ── the other channels the week actually happened in ──────────────────────────
+    # Best-effort and labelled per channel, so the model can attribute a blocker to
+    # the standup it was said in rather than to the room it was repeated in. A channel
+    # Susan cannot read is skipped with a warning; it never fails the update.
+    extra_sections: list[str] = []
+    for cid in weekly_extra_channel_ids(exclude=hist_channel):
+        try:
+            blob = await fetch_slack_channel_history_since(cid, oldest_ts, user)
+        except Exception as e:
+            logger.warning("Weekly status: channel %s unreadable: %s", cid, e)
+            continue
+        if blob and not blob.strip().startswith("(No channel messages"):
+            extra_sections.append(f"#### <#{cid}>\n{blob}")
+    extra_channels_block = (
+        "\n---\n### Other channels this window (same period, different rooms)\n"
+        + "\n\n".join(extra_sections) + "\n"
+        if extra_sections else ""
+    )
 
     # ── meetings: where decisions are actually taken ───────────────────────────────
     # The weekly read Slack, GitHub and Drive and NOT Granola, so "Decisions" was only
@@ -356,6 +399,7 @@ async def process_weekly_status(
             f"{bookmark_section}"
             f"---\n### GitHub (all configured repos for this weekly run)\n{facts}"
             f"{drive_block}"
+            f"{extra_channels_block}"
             f"{meetings_block}"
             + (f"\n---\n{metrics_observations_prompt(metrics_block)}\n" if metrics_block else "")
         )
@@ -391,6 +435,7 @@ async def process_weekly_status(
             f"---\n### Slack transcript\n{slack_digest}\n"
             f"{bookmark_section}"
             f"{drive_block}"
+            f"{extra_channels_block}"
             f"{meetings_block}"
             + (f"\n---\n{metrics_observations_prompt(metrics_block)}\n" if metrics_block else "")
         )

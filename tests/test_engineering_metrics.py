@@ -157,3 +157,26 @@ def test_no_previous_snapshot_means_no_invented_trend() -> None:
     out = render(EngineeringMetrics(merged=20, lead_time_median_h=4.0), None)
     # " (flat)" with the parens: the caveat line legitimately contains "flatters".
     assert "↑" not in out and "↓" not in out and " (flat)" not in out
+
+
+def test_weekly_reads_the_standup_and_review_channels_too() -> None:
+    """The week happens in three rooms; reading one made the update a summary of
+    whatever people happened to announce in #team-tech."""
+    import os
+
+    from app.weekly_status import weekly_extra_channel_ids
+
+    ids = weekly_extra_channel_ids()
+    assert "C0C35UE399B" in ids          # team-tech-standups
+    assert "C0C2PJ99PKL" in ids          # team-tech-reviews
+    # The channel already being read is never fetched twice.
+    assert "C0C35UE399B" not in weekly_extra_channel_ids(exclude="C0C35UE399B")
+    # Configurable, and an explicit empty value turns the feature off rather than
+    # silently falling back to the default.
+    os.environ["SUSAN_WEEKLY_EXTRA_CHANNELS"] = ""
+    try:
+        assert weekly_extra_channel_ids() == []
+        os.environ["SUSAN_WEEKLY_EXTRA_CHANNELS"] = "C1, C2 ,C1"
+        assert weekly_extra_channel_ids() == ["C1", "C2"]
+    finally:
+        del os.environ["SUSAN_WEEKLY_EXTRA_CHANNELS"]
