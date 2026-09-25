@@ -8,11 +8,18 @@ from app.weekly_canvas import slack_mrkdwn_to_canvas_markdown, weekly_status_use
 
 
 def test_slack_mrkdwn_to_canvas_markdown() -> None:
+    """A bold section line is a HEADING in the Canvas, not bold body text.
+
+    It was bold until 2026-09-25, which is why the Canvas read as a wall of
+    paragraphs with no structure (operator: "would like for it to be more neatly,
+    clearly and easy to read formatted"). Slack mrkdwn has no heading syntax, so the
+    model writes a section as a bold line and the converter is what gives it one.
+    """
     src = "*Platform*\n- did <https://github.com/o/r/pull/1|PR #1> thing\n*1. Last week:*\n a. foo"
     out = slack_mrkdwn_to_canvas_markdown(src)
-    assert "**Platform**" in out
+    assert "## Platform" in out
     assert "[PR #1](https://github.com/o/r/pull/1)" in out
-    assert "**1. Last week:**" in out
+    assert "## 1. Last week:" in out
 
 
 def test_model_emitted_horizontal_rules_are_dropped() -> None:
@@ -21,15 +28,15 @@ def test_model_emitted_horizontal_rules_are_dropped() -> None:
     assert not any(
         line.strip() in ("---", "***", "___", "===") for line in out.splitlines()
     )
-    assert "**Platform**" in out
-    assert "**Onboarding**" in out
+    assert "## Platform" in out
+    assert "## Onboarding" in out
     assert "\n\n\n" not in out
 
 
 def test_rule_directly_under_text_does_not_become_a_heading() -> None:
     # "latency down\n---" would parse as a setext H2 in the Canvas renderer.
     out = slack_mrkdwn_to_canvas_markdown("latency down\n---\n*Onboarding*")
-    assert out == "latency down\n\n**Onboarding**"
+    assert out == "latency down\n\n## Onboarding"
 
 
 def test_canvas_document_keeps_single_footer_rule() -> None:

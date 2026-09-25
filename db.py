@@ -1132,7 +1132,7 @@ async def upsert_published_page(
     slug: str, kind: str, title: str, html: str,
     *, model_route: str | None = None, model_name: str | None = None,
 ) -> None:
-    async with async_session() as session:
+    async with SessionLocal() as session:
         row = await session.get(PublishedPage, slug)
         now = datetime.now(timezone.utc)
         if row is None:
@@ -1145,7 +1145,7 @@ async def upsert_published_page(
 
 
 async def get_published_page(slug: str) -> dict | None:
-    async with async_session() as session:
+    async with SessionLocal() as session:
         row = await session.get(PublishedPage, slug)
         if row is None:
             return None
@@ -1156,7 +1156,7 @@ async def get_published_page(slug: str) -> dict | None:
 async def latest_published_page(kind: str) -> dict | None:
     from sqlalchemy import select
 
-    async with async_session() as session:
+    async with SessionLocal() as session:
         q = select(PublishedPage).where(PublishedPage.kind == kind).order_by(PublishedPage.created_at.desc()).limit(1)
         row = (await session.execute(q)).scalars().first()
         if row is None:

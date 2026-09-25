@@ -223,3 +223,27 @@ def test_status_route_is_404_without_the_right_token(monkeypatch: pytest.MonkeyP
     assert r.status_code == 200 and "PAGE" in r.text
     assert r.headers["cache-control"] == "private, no-store"
     assert c.get("/status/env-missing?k=tok").status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_published_page_round_trips_through_the_real_db_layer(tmp_path, monkeypatch) -> None:
+    """The accessors ran against a session factory that does not exist.
+
+    Every earlier test stubbed `upsert_published_page`, so the first LIVE run in Slack
+    was the first time the real code path ran — and it failed with
+    `name 'async_session' is not defined`. This exercises the accessors themselves.
+    """
+    import sys
+
+    monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "t.db"))
+    sys.modules.pop("db", None)
+    import db as dbmod
+
+    await dbmod.init_db()
+    await dbmod.upsert_published_page("env-1", "env-status", "T", "<html>A</html>",
+                                      model_route="sovereign", model_name="glm-5.3-flash")
+    got = await dbmod.get_published_page("env-1")
+    assert got["html"] == "<html>A</html>" and got["model_name"] == "glm-5.3-flash"
+    await dbmod.upsert_published_page("env-2", "env-status", "T2", "<html>B</html>")
+    assert (await dbmod.latest_published_page("env-status"))["slug"] == "env-2"
+    assert await dbmod.get_published_page("nope") is None
