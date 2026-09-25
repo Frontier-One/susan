@@ -231,6 +231,13 @@ def _narrative_system_prompt() -> str:
           else worth a lead's attention. Cite the issue or PR when the alerts or issues
           give one; say "unfiled" when nothing owns it.
         - "cleared" only for things the sources show as fixed, not things merely quiet.
+        - AN ISSUE NUMBER IN THE ALERTS IS NOT PROOF IT IS STILL OPEN. The alert
+          channels are a week of history and an issue named there may have been
+          closed since. Before calling something a blocker on the strength of an
+          alert, check the open-issues list you were given: if the issue is not in
+          it, either drop the item or write it as "unfiled" on the live evidence
+          alone. Naming a closed issue as a current blocker is the one error that
+          makes the whole page untrustworthy.
         - If the facts for an environment are NOT MEASURED, say so plainly; never infer health.
         - If the sources are thin, write less. An honest short page beats a padded one.
         """
@@ -255,6 +262,22 @@ def parse_narrative(text: str) -> dict[str, Any] | None:
     return d
 
 
+def _alerts_budget() -> int:
+    """Characters of alert-channel traffic sent to the model.
+
+    Was 60k, which put ~20k tokens in front of a self-hosted model and timed the
+    narrative out (2026-09-24) — the page then rendered facts-only and looked broken.
+    The narrative needs the SHAPE of recent alerting, not a transcript.
+    """
+    n = int((os.environ.get("SUSAN_STATUS_PAGE_ALERT_CHARS") or "16000").strip() or "16000")
+    return max(2_000, min(120_000, n))
+
+
+def _issues_budget() -> int:
+    n = int((os.environ.get("SUSAN_STATUS_PAGE_ISSUE_CHARS") or "6000").strip() or "6000")
+    return max(1_000, min(40_000, n))
+
+
 def _narrative_lookback_days() -> int:
     n = int((os.environ.get("SUSAN_STATUS_PAGE_LOOKBACK_DAYS") or "7").strip() or "7")
     return max(1, min(30, n))
@@ -270,7 +293,7 @@ async def gather_context(user: str, token: str) -> tuple[str, str]:
     alerts_parts: list[str] = []
     try:
         ids, _missing = await resolve_alert_channel_ids()
-        for cid in ids[:4]:
+        for cid in ids[:3]:
             try:
                 blob = await fetch_slack_channel_history_since(cid, oldest, user)
                 alerts_parts.append(f"## <#{cid}>\n{blob}")
@@ -305,8 +328,9 @@ async def build_narrative(rows: list[dict[str, Any]], alerts: str, issues: str, 
     user_prompt = (
         f"Snapshot: last night's probe, run {snapshot_when or '(time unknown)'}.\n\n"
         f"### Measured facts (authoritative — do not restate numbers, code renders them)\n{facts_for_prompt(rows)}\n\n"
-        f"### Alert channels, last {_narrative_lookback_days()} days\n{alerts[:60000]}\n\n"
-        f"### Open roadmap issues updated in the window\n{issues[:12000]}\n\n"
+        f"### Alert channels, last {_narrative_lookback_days()} days (most recent first, truncated)\n"
+        f"{alerts[:_alerts_budget()]}\n\n"
+        f"### Open roadmap issues updated in the window\n{issues[:_issues_budget()]}\n\n"
         f"### Output schema\n{_NARRATIVE_SCHEMA}"
     )
     # Our own models, by design: this page is the sovereign-route showcase.
@@ -476,12 +500,17 @@ def slack_summary(rows: list[dict[str, Any]], narrative: dict[str, Any] | None, 
             parts.append(f"*{r['name']}* not measured")
         else:
             parts.append(f"*{r['name']}* {r['apps']['synced_healthy']}/{r['apps_total']} apps clean · {r['clusters_up']}/{len(r['clusters'])} clusters up")
-    n_block = len((narrative or {}).get("blockers") or [])
     head = ((narrative or {}).get("standfirst") or "").strip()
+    if narrative is None:
+        tail = ("\n:warning: The model did not return a narrative this run, so the page carries the "
+                "measured facts only — no readings, no blockers. Nothing on it is inferred.")
+    else:
+        tail = f"\n{len(narrative.get('blockers') or [])} blocker(s) named."
     return (
         "*Environment status* — " + " · ".join(parts)
         + (f"\n{head}" if head else "")
-        + f"\n{n_block} blocker(s) named. Full page: <{url}|environment status>"
+        + tail
+        + f" Full page: <{url}|environment status>"
     )
 
 
