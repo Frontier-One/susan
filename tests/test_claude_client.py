@@ -14,7 +14,12 @@ async def test_call_claude_reports_sovereign_route(
     monkeypatch.setattr(client, "f1_model_active", lambda: True)
 
     async def fake_f1(
-        system: str, user: str, max_tokens: int | None = None
+        system: str,
+        user: str,
+        max_tokens: int | None = None,
+        *,
+        model: str | None = None,
+        base_url: str | None = None,
     ) -> tuple[str, str]:
         return "sovereign response", "deepseek-ai-deepseek-v4-a05f5b"
 

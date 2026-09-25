@@ -17,7 +17,12 @@ from app.config import (
     f1_model_active,
     logger,
 )
-from app.model_routing import is_commercial_action, resolve_model, route_for_action
+from app.model_routing import (
+    is_commercial_action,
+    resolve_model,
+    route_for_action,
+    sovereign_override,
+)
 
 
 class ModelCompletion(str):
@@ -36,14 +41,19 @@ class ModelCompletion(str):
 
 
 async def _call_f1_sovereign(
-    system: str, user: str, max_tokens: int | None = None
+    system: str,
+    user: str,
+    max_tokens: int | None = None,
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
 ) -> tuple[str, str]:
     """Call the self-hosted FrontierOne model via its OpenAI-compatible endpoint.
 
     Returns (text, served_model). The served model is read back from the response
     so attribution reflects what answered, not what we asked for.
     """
-    url = f"{F1_MODEL_BASE_URL}/chat/completions"
+    url = f"{(base_url or F1_MODEL_BASE_URL).rstrip('/')}/chat/completions"
     headers = {"content-type": "application/json"}
     if F1_MODEL_API_KEY:
         headers["Authorization"] = f"Bearer {F1_MODEL_API_KEY}"
@@ -51,7 +61,7 @@ async def _call_f1_sovereign(
         user = "[earlier context truncated]\n" + user[-F1_MODEL_MAX_PROMPT_CHARS:]
     req_max = max_tokens if max_tokens is not None else F1_MODEL_MAX_COMPLETION_TOKENS
     body = {
-        "model": F1_MODEL_NAME,
+        "model": model or F1_MODEL_NAME,
         "max_tokens": min(req_max, F1_MODEL_MAX_COMPLETION_TOKENS),
         "messages": [
             {"role": "system", "content": system},
@@ -266,7 +276,10 @@ async def call_claude(
         )
         return ModelCompletion(text, model_route="commercial", model_name=model)
     if requested_route in ("sovereign", "local") and f1_model_active():
-        text, served_model = await _call_f1_sovereign(system, user, max_tokens)
+        ov_model, ov_base = sovereign_override(action)
+        text, served_model = await _call_f1_sovereign(
+            system, user, max_tokens, model=ov_model, base_url=ov_base
+        )
         logger.info(
             "LLM route: F1 sovereign (action=%s model=%s)", action, served_model
         )
