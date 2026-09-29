@@ -381,6 +381,116 @@ async def _fetch_thread_reply_lines(
     return lines
 
 
+def _speaker_of(message: dict) -> str:
+    """Who posted, for a human OR an app.
+
+    A bot post carries no `user` field at all — it has `bot_id`, usually
+    `username`, sometimes `bot_profile.name`. Reading only `user` rendered every
+    integration's message as `unknown:`, which is how four attributed standups
+    reached the model as four anonymous lines.
+    """
+    uid = message.get("user")
+    if uid:
+        return str(uid)
+    profile = message.get("bot_profile") or {}
+    return str(
+        message.get("username")
+        or profile.get("name")
+        or message.get("bot_id")
+        or "unknown"
+    )
+
+
+def _message_text(message: dict) -> str:
+    """Everything a reader would SEE in this message, not just its `text` field.
+
+    WHY THIS EXISTS (2026-09-29). The daily standup digest came back empty on a
+    day when four people had posted full written standups. The standup app posts
+    one message per person whose `text` is only the placeholder line
+
+        *Stacy Gorelik* posted an update for *Tech-Standups*
+
+    and puts every question and answer in `attachments[]`. Reading `text` alone
+    therefore fed the model four placeholders and no content, and the digest
+    correctly reported that its sources were too thin — it was describing what it
+    had been handed, which was nothing.
+
+    Slack has three places a message can carry visible content and an app may use
+    any of them: `text`, legacy `attachments`, and Block Kit `blocks`. All three
+    are collected here. A message whose content is entirely in blocks (the modern
+    shape) had the same problem and would have been the next thing to bite.
+
+    Deduplicated because `attachments[].fallback` usually repeats the attachment's
+    own title and text, and Block Kit sections frequently repeat `text` verbatim;
+    without this the digest sees each answer two or three times and weights it
+    accordingly.
+    """
+    parts: list[str] = []
+
+    def add(value) -> None:
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned:
+                parts.append(cleaned)
+
+    add(message.get("text"))
+
+    for att in message.get("attachments") or []:
+        if not isinstance(att, dict):
+            continue
+        add(att.get("pretext"))
+        add(att.get("title"))
+        add(att.get("text"))
+        for field in att.get("fields") or []:
+            if isinstance(field, dict):
+                add(field.get("title"))
+                add(field.get("value"))
+        add(att.get("footer"))
+        # `fallback` last: it is the plain-text rendering of the rest of the
+        # attachment, so it is only worth anything when the structured fields
+        # were empty. The dedup below drops it when they were not.
+        add(att.get("fallback"))
+        for block in att.get("blocks") or []:
+            _collect_block_text(block, add)
+
+    for block in message.get("blocks") or []:
+        _collect_block_text(block, add)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for part in parts:
+        if part not in seen:
+            seen.add(part)
+            out.append(part)
+    return "\n".join(out)
+
+
+def _collect_block_text(block, add) -> None:
+    """Pull the visible strings out of one Block Kit block, whatever its type.
+
+    Walked structurally rather than by block type: Slack adds block and element
+    types over time, and a digest that silently drops an unfamiliar one is the
+    same failure this function was written to fix. Anything carrying a `text`
+    string is collected, so a new block type degrades to "we read it" rather
+    than "we ignored it".
+    """
+    if isinstance(block, list):
+        for item in block:
+            _collect_block_text(item, add)
+        return
+    if not isinstance(block, dict):
+        return
+    text = block.get("text")
+    if isinstance(text, str):
+        add(text)
+    elif isinstance(text, dict):
+        add(text.get("text"))
+    for key in ("elements", "fields", "accessory"):
+        value = block.get(key)
+        if value is not None:
+            _collect_block_text(value, add)
+
+
 async def fetch_slack_channel_history_since(
     channel: str,
     oldest_slack_ts: str,
@@ -459,8 +569,8 @@ async def fetch_slack_channel_history_since(
     total_len = 0
     truncated = False
     for m in msgs:
-        uid = m.get("user", "unknown")
-        text = m.get("text", "")
+        uid = _speaker_of(m)
+        text = _message_text(m)
         line = f"{uid}: {text}"
         if total_len + len(line) + 1 > max_chars:
             truncated = True
