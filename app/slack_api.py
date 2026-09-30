@@ -427,11 +427,29 @@ def _message_text(message: dict) -> str:
     """
     parts: list[str] = []
 
-    def add(value) -> None:
-        if isinstance(value, str):
-            cleaned = value.strip()
-            if cleaned:
-                parts.append(cleaned)
+    seen: set[str] = set()
+
+    def add(value, *, always: bool = False) -> None:
+        """Collect one visible string.
+
+        `always` OPTS OUT OF DEDUP, and exists for attachment fields. Dedup is
+        here because `fallback` repeats the attachment and Block Kit repeats
+        `text`, so the same sentence arrives two or three times and the digest
+        weights it accordingly. A FIELD is different: it is half of a
+        question-and-answer pair, and two standup questions answered "None"
+        are two answers. Dropping the second left its question in the digest
+        with nothing under it (cubic P2) — content loss dressed as tidiness.
+        """
+        if not isinstance(value, str):
+            return
+        cleaned = value.strip()
+        if not cleaned:
+            return
+        if not always:
+            if cleaned in seen:
+                return
+            seen.add(cleaned)
+        parts.append(cleaned)
 
     add(message.get("text"))
 
@@ -443,26 +461,26 @@ def _message_text(message: dict) -> str:
         add(att.get("text"))
         for field in att.get("fields") or []:
             if isinstance(field, dict):
-                add(field.get("title"))
-                add(field.get("value"))
+                add(field.get("title"), always=True)
+                add(field.get("value"), always=True)
         add(att.get("footer"))
-        # `fallback` last: it is the plain-text rendering of the rest of the
-        # attachment, so it is only worth anything when the structured fields
-        # were empty. The dedup below drops it when they were not.
-        add(att.get("fallback"))
+        # `fallback` ONLY when there is nothing structured to render. Relying on
+        # the dedup below did not work: a fallback of "Q: A" is not
+        # string-equal to title "Q" or text "A", so it survived and the model
+        # saw the same content twice (cubic P2). Absence of structure is the
+        # condition that actually makes a fallback worth reading.
+        if not any(
+            att.get(key)
+            for key in ("pretext", "title", "text", "fields", "footer", "blocks")
+        ):
+            add(att.get("fallback"))
         for block in att.get("blocks") or []:
             _collect_block_text(block, add)
 
     for block in message.get("blocks") or []:
         _collect_block_text(block, add)
 
-    seen: set[str] = set()
-    out: list[str] = []
-    for part in parts:
-        if part not in seen:
-            seen.add(part)
-            out.append(part)
-    return "\n".join(out)
+    return "\n".join(parts)
 
 
 def _collect_block_text(block, add) -> None:

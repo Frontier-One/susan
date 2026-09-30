@@ -112,3 +112,42 @@ def test_malformed_attachments_and_blocks_do_not_crash() -> None:
     """Slack payloads are not ours; a digest must not die on an odd one."""
     msg = {"user": "U1", "text": "ok", "attachments": ["not a dict", None], "blocks": ["nope", 7]}
     assert _message_text(msg) == "ok"
+
+
+def test_two_questions_with_the_same_answer_both_keep_it() -> None:
+    """A field is half of a question-and-answer pair, and two standup questions
+    answered "None" are two answers. A global dedup dropped the second, leaving
+    its question in the digest with nothing under it — content loss dressed as
+    tidiness (cubic P2 on PR #31)."""
+    msg = {
+        "user": "U1",
+        "attachments": [{"fields": [
+            {"title": "What did you do yesterday?", "value": "None"},
+            {"title": "Any blockers?", "value": "None"},
+        ]}],
+    }
+    out = _message_text(msg)
+    assert out.count("None") == 2, out
+    # and each question still sits immediately above its own answer
+    assert out.index("What did you do yesterday?") < out.index("None")
+    assert out.index("Any blockers?") < out.rindex("None")
+
+
+def test_a_combined_fallback_does_not_duplicate_structured_content() -> None:
+    """`fallback` is the plain-text rendering of the attachment. A fallback of
+    "Q: A" is not string-equal to title "Q" or text "A", so dedup could not
+    catch it and the model saw the same content twice (cubic P2)."""
+    msg = {
+        "user": "U1",
+        "attachments": [{"title": "Deploy", "text": "red", "fallback": "Deploy: red"}],
+    }
+    out = _message_text(msg)
+    assert "Deploy: red" not in out, out
+    assert "Deploy" in out and "red" in out
+
+
+def test_fallback_is_still_read_when_there_is_nothing_else() -> None:
+    """The control. Gating the fallback must not silence an attachment that has
+    only a fallback — which is the one case it was always for."""
+    msg = {"user": "U1", "attachments": [{"fallback": "the only content there is"}]}
+    assert "the only content there is" in _message_text(msg)
