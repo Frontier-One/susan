@@ -8,6 +8,7 @@ This document is for anyone **deploying** or **hardening** Susan. Slack slash co
 |--------|----------------------|
 | `POST /susan`, `POST /susan/actions` | Slack [request signing](https://api.slack.com/authentication/verifying-requests-from-slack): each request must include a valid `X-Slack-Signature` and a timestamp within **~5 minutes** of server time. That limit applies only to **that HTTP request** (anti-replay). It is **not** a user session timeout: Slack users do **not** need to reconnect to Susan every five minutes. |
 | OAuth `state` (Google/GitHub browser flow) | HMAC-SHA256 over JSON payload + expiry. Default link lifetime **24 hours** (`OAUTH_STATE_TTL_SECONDS`, minimum 300s). This is only how long the **“Connect” URL** remains valid; after a successful connect, **Google refresh tokens** and **GitHub access tokens** stay in the database until the user reconnects or revokes access. |
+| `POST /farm/event` | Bearer token `FARM_EVENT_TOKEN`, compared in constant time; unset means every call is 401. Body validated field by field (kind from a fixed list, `owner/repo`, GitHub logins, a `https://github.com/` URL); anything else is a 400. |
 | GitHub repo targets | `GITHUB_REPOS` / `GITHUB_ISSUES_REPOS` allowlists (when set) constrain which `owner/repo` values are honored. |
 
 Unauthenticated endpoints include OAuth browser redirects, `GET /`, and `GET /health`. They do not accept Slack commands.
@@ -27,6 +28,12 @@ Without an allowlist, a user who can run `/susan` and who types `owner/repo` in 
 ### OAuth state secret (`OAUTH_STATE_SECRET`)
 
 By default, OAuth state is signed with `SLACK_SIGNING_SECRET`. For defense in depth, set a **dedicated** `OAUTH_STATE_SECRET` (long random string) so a compromised Slack signing secret does not automatically forge OAuth state.
+
+### Farm events (`FARM_EVENT_TOKEN`)
+
+`POST /farm/event` is **not** a Slack-signed endpoint, and cannot be: the caller is the dev-tools farm, not Slack, so it holds no Slack signing secret and should not. Handing the farm that secret would let it forge slash commands and button clicks as any user. A shared bearer is the right control for one known service calling another: it is scoped to this one route, can be rotated on its own, and grants nothing beyond what the route does. What the route does is narrow on purpose: it relays a notice to people already named in the Forseti rota and one channel line. It takes no action on GitHub, holds no farm credential and never calls the farm back, so a leaked token can at worst send misleading notices, rate-limited in effect by the 10-minute dedupe on (kind, repo, number). The farm's free text is escaped before it reaches Slack, so it cannot mention people or carry links other than the validated GitHub URL. Keep the route on a network path only the farm can reach where you can, and set a long random token.
+
+The login map comes from `policy/forseti-rotation.yaml` on dev-tools' **default branch**, read with Susan's GitHub credential (`GITHUB_TOKEN`, or the connect of `SUSAN_FARM_EVENT_GITHUB_USER`). The caller cannot choose who is DMed beyond naming a GitHub login; a login not in the rota's `people` table reaches nobody.
 
 ### Weekly auto-post (`--no-approval`)
 

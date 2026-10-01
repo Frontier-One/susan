@@ -28,6 +28,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from app.babysit import farm_configured, process_babysit
+from app.farm_event import FarmEvent, bearer_ok, is_duplicate, process_farm_event
 from app.config import ACTIONS, GITHUB_ACTIONS, GOOGLE_ACTIONS, logger
 from app.github_pickers import (
     post_github_repo_multi_summary_picker_ephemeral,
@@ -1535,6 +1536,33 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
     if payload.get("type") == "event_callback":
         background_tasks.add_task(handle_slack_event_callback, payload)
     return JSONResponse({"ok": True})
+
+
+@app.post("/farm/event")
+async def farm_event(request: Request, background_tasks: BackgroundTasks):
+    """A farm stopped on a person (dev-tools#152). Not Slack-signed: the farm is not
+    Slack, so the caller proves itself with `FARM_EVENT_TOKEN` (see SECURITY.md)."""
+    from pydantic import ValidationError
+
+    if not bearer_ok(request.headers.get("Authorization", "")):
+        raise HTTPException(status_code=401, detail="Missing or invalid bearer token",
+                            headers={"WWW-Authenticate": "Bearer"})
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    try:
+        event = FarmEvent.model_validate(body)
+    except ValidationError as e:
+        err = e.errors()[0]
+        field = ".".join(str(p) for p in err.get("loc", ())) or "body"
+        raise HTTPException(status_code=400, detail=f"Invalid field `{field}`: {err.get('msg', 'invalid')}")
+    if is_duplicate(event):
+        return JSONResponse({"ok": True, "duplicate": True}, status_code=202)
+    background_tasks.add_task(process_farm_event, event)
+    return JSONResponse({"ok": True}, status_code=202)
 
 
 @app.post("/susan/actions")
