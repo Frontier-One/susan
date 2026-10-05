@@ -355,6 +355,21 @@ class MetricSnapshot(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class StatusSnapshot(Base):
+    """One day's per-environment facts, so a later run can diff today against it.
+
+    The "cleared since last time" list is arithmetic over these facts, not a model
+    memory. Keyed by the probe date (YYYY-MM-DD) so re-running the same day
+    overwrites rather than doubling as its own baseline.
+    """
+
+    __tablename__ = "status_snapshots"
+
+    key: Mapped[str] = mapped_column(String(16), primary_key=True)   # e.g. "2026-09-24"
+    payload: Mapped[str] = mapped_column(Text, nullable=False)       # JSON list of env-fact rows
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class PublishedPage(Base):
     """An HTML page Susan rendered and hosts (GET /status/{slug}); e.g. the environment status."""
 
@@ -1172,12 +1187,32 @@ async def latest_published_page(kind: str) -> dict | None:
     from sqlalchemy import select
 
     async with SessionLocal() as session:
-        q = select(PublishedPage).where(PublishedPage.kind == kind).order_by(PublishedPage.created_at.desc()).limit(1)
+        q = select(PublishedPage).where(PublishedPage.kind == kind).order_by(
+            PublishedPage.created_at.desc(), PublishedPage.slug.asc()
+        ).limit(1)
         row = (await session.execute(q)).scalars().first()
         if row is None:
             return None
         return {"slug": row.slug, "kind": row.kind, "title": row.title, "html": row.html,
                 "created_at": row.created_at, "model_route": row.model_route, "model_name": row.model_name}
+
+
+async def prune_published_pages(kind: str, older_than: datetime) -> int:
+    """Delete published pages of a kind whose created_at is strictly older than ``older_than``.
+
+    The stable env-status slug is re-stamped on every run, so it is never older than
+    the cutoff; the dated archives are what this prunes. Returns the number removed.
+    """
+    from sqlalchemy import delete
+
+    async with SessionLocal() as session:
+        q = delete(PublishedPage).where(
+            PublishedPage.kind == kind,
+            PublishedPage.created_at < older_than,
+        )
+        result = await session.execute(q)
+        await session.commit()
+        return result.rowcount or 0
 
 
 # ── Metric snapshots (week-over-week trends, computed not remembered) ──────────────────
@@ -1220,3 +1255,48 @@ async def previous_metric_snapshot(prefix: str, before_key: str) -> dict | None:
             return _json.loads(row.payload)
         except Exception:
             return None
+
+
+# ── Status snapshots (the status page's day-over-day diff, computed not remembered) ────
+
+
+async def upsert_status_snapshot(key: str, payload: list[dict]) -> None:
+    import json as _json
+
+    async with SessionLocal() as session:
+        row = await session.get(StatusSnapshot, key)
+        now = datetime.now(timezone.utc)
+        if row is None:
+            session.add(StatusSnapshot(key=key, payload=_json.dumps(payload), created_at=now))
+        else:
+            row.payload, row.created_at = _json.dumps(payload), now
+        await session.commit()
+
+
+async def previous_status_snapshot(before_key: str) -> list[dict] | None:
+    """The most recent snapshot strictly older than ``before_key``.
+
+    Keyed comparison, not "the second newest row": re-running the same day must not
+    turn that day into its own baseline and report every delta as flat.
+    """
+    import json as _json
+
+    from sqlalchemy import select
+
+    async with SessionLocal() as session:
+        q = (
+            select(StatusSnapshot)
+            .where(StatusSnapshot.key < before_key)
+            .order_by(StatusSnapshot.key.desc())
+            .limit(1)
+        )
+        row = (await session.execute(q)).scalars().first()
+        if row is None:
+            return None
+        try:
+            payload = _json.loads(row.payload)
+        except Exception:
+            return None
+        if isinstance(payload, list) and all(isinstance(item, dict) for item in payload):
+            return payload
+        return None

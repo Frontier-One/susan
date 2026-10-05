@@ -4,7 +4,7 @@ from __future__ import annotations
 import io
 import json
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -159,7 +159,10 @@ async def test_process_builds_stores_and_posts(monkeypatch: pytest.MonkeyPatch) 
     stored: dict[str, object] = {}
 
     async def upsert(slug, kind, title, html, **kw):
-        stored.update(slug=slug, kind=kind, html=html, **kw)
+        stored[f"slug:{slug}"] = {"kind": kind, "html": html, **kw}
+
+    async def prune(kind, older_than):
+        return 0
 
     posted: dict[str, object] = {}
 
@@ -177,14 +180,32 @@ async def test_process_builds_stores_and_posts(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(sp, "post_message", post)
     monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
 
+    seen_cleared: dict[str, object] = {}
+
+    async def prev(before_key: str):
+        seen_cleared["before_key"] = before_key
+        return None
+
+    async def snap_store(key: str, payload: list) -> None:
+        seen_cleared["stored"] = payload
+
+    monkeypatch.setattr(sp, "previous_status_snapshot", prev)
+    monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
+    monkeypatch.setattr(sp, "prune_published_pages", prune)
+
     await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
 
     assert seen["route"] == "sovereign"                       # our own models, by design
     assert "do not restate numbers" in str(seen["prompt"])
-    assert stored["kind"] == "env-status" and stored["slug"].startswith("env-")
-    assert "<b>53</b>" in str(stored["html"]) and "#1563" in str(stored["html"])
+    stable = stored["slug:env-status"]
+    archive = stored["slug:env-status-2026-09-24"]
+    assert stable["kind"] == "env-status" and archive["kind"] == "env-status"
+    assert "<b>53</b>" in str(stable["html"]) and "#1563" in str(stable["html"])
+    assert stable["html"] == archive["html"]                  # both carry the same rendered page
     assert posted["channel"] == "C1"
-    assert f"/status/{stored['slug']}?k=tok" in str(posted["text"])
+    assert f"/status/env-status?k=tok" in str(posted["text"])  # Slack links to the stable slug
+    assert seen_cleared["before_key"] == "2026-09-24"         # today's snapshot date feeds the prior lookup
+    assert seen_cleared["stored"] == sp.env_facts(SNAP)       # today's facts are stored for tomorrow
 
 
 def test_schedule_add_parses_status_page() -> None:
@@ -249,6 +270,61 @@ async def test_published_page_round_trips_through_the_real_db_layer(tmp_path, mo
     assert await dbmod.get_published_page("nope") is None
 
 
+@pytest.mark.asyncio
+async def test_stable_and_archive_publish_and_prune_through_the_real_db_layer(tmp_path, monkeypatch) -> None:
+    """Stable slug overwrites each run, the dated archive is kept, and pruning removes
+    only archives older than the cutoff. Drives the real db helpers."""
+    import sys
+
+    monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "t.db"))
+    sys.modules.pop("db", None)
+    import db as dbmod
+
+    await dbmod.init_db()
+
+    # a run writes the stable slug plus a dated archive, both of the same kind
+    await dbmod.upsert_published_page("env-status", "env-status", "T", "<html>NOV</html>")
+    await dbmod.upsert_published_page("env-status-2026-10-01", "env-status", "T", "<html>OCT</html>")
+    await dbmod.upsert_published_page("env-status-2026-09-25", "env-status", "T", "<html>SEP</html>")
+
+    assert (await dbmod.get_published_page("env-status"))["kind"] == "env-status"
+    assert (await dbmod.get_published_page("env-status-2026-10-01"))["kind"] == "env-status"
+    assert (await dbmod.get_published_page("env-status-2026-09-25"))["kind"] == "env-status"
+
+    # a second run overwrites the stable slug without duplicating it
+    await dbmod.upsert_published_page("env-status", "env-status", "T", "<html>NOV2</html>")
+    assert (await dbmod.get_published_page("env-status"))["html"] == "<html>NOV2</html>"
+
+    # latest resolves to the newest of the kind
+    latest = await dbmod.latest_published_page("env-status")
+    assert latest is not None and latest["kind"] == "env-status" and latest["html"] == "<html>NOV2</html>"
+
+    # backdate the two archives so pruning is deterministic
+    now = datetime.now(timezone.utc)
+    async with dbmod.SessionLocal() as session:
+        from sqlalchemy import select
+
+        rows = (await session.execute(select(dbmod.PublishedPage))).scalars().all()
+        for r in rows:
+            if r.slug == "env-status-2026-10-01":
+                r.created_at = now - timedelta(days=5)
+            elif r.slug == "env-status-2026-09-25":
+                r.created_at = now - timedelta(days=40)
+        await session.commit()
+
+    # prune everything older than 30 days: only the 40-day-old archive goes
+    removed = await dbmod.prune_published_pages("env-status", now - timedelta(days=30))
+    assert removed == 1
+    assert await dbmod.get_published_page("env-status") is not None       # stable stays
+    assert await dbmod.get_published_page("env-status-2026-10-01") is not None
+    assert await dbmod.get_published_page("env-status-2026-09-25") is None
+
+    # a different kind is untouched
+    await dbmod.upsert_published_page("weekly/foo", "weekly", "T", "<html>W</html>")
+    await dbmod.prune_published_pages("env-status", now - timedelta(days=365))
+    assert (await dbmod.get_published_page("weekly/foo")) is not None
+
+
 # ── narrative extraction, hardened 2026-09-25 ─────────────────────────────────────────
 # It parsed clean on GLM and failed on DeepSeek, which answered with the object wrapped
 # in prose — so the live page rendered facts-only twice. A model that gave us the
@@ -276,3 +352,149 @@ def test_no_object_at_all_is_still_None() -> None:
     assert sp.parse_narrative("I could not read the cluster.") is None
     assert sp.parse_narrative("") is None
     assert sp.parse_narrative("[1, 2, 3]") is None
+
+
+# ── day's diff: computed cleared list from stored snapshots ───────────────────────────
+
+
+def test_cleared_facts_lists_envs_recovered_to_healthy() -> None:
+    current = [
+        {"name": "dev", "state": "healthy"},
+        {"name": "freya", "state": "healthy"},
+        {"name": "heimdall", "state": "unmeasured"},
+    ]
+    previous = [
+        {"name": "dev", "state": "degraded"},
+        {"name": "freya", "state": "healthy"},
+        {"name": "heimdall", "state": "unmeasured"},
+    ]
+    # dev went from degraded to healthy; freya stayed healthy; heimdall is still unmeasured.
+    assert sp.cleared_facts(current, previous) == ["dev"]
+
+
+def test_cleared_facts_no_previous_snapshot_clears_nothing() -> None:
+    assert sp.cleared_facts(sp.env_facts(SNAP), None) == []
+
+
+def test_cleared_facts_purely_arithmetic_over_env_states() -> None:
+    current = [
+        {"name": "a", "state": "healthy"},
+        {"name": "b", "state": "healthy"},
+        {"name": "c", "state": "degraded"},
+    ]
+    previous = [
+        {"name": "a", "state": "degraded"},
+        {"name": "b", "state": "attention"},
+        {"name": "c", "state": "healthy"},
+    ]
+    # a and b recovered to healthy; c went the other way and is not cleared.
+    assert sp.cleared_facts(current, previous) == ["a", "b"]
+
+
+def test_computed_cleared_lands_in_rendered_html() -> None:
+    current = sp.env_facts(SNAP)
+    html = sp.render_status_page(current, None, snapshot_when="2026-09-25T04:45:00Z", run_url="",
+                                 generated_at=datetime(2026, 9, 25, 17, 0, tzinfo=timezone.utc),
+                                 model_name=None, cleared=["dev"])
+    assert "Cleared since last time" in html
+    assert "<li>dev</li>" in html
+    assert "2026-09-25" in html
+
+
+def test_computed_cleared_empty_renders_no_block() -> None:
+    html = sp.render_status_page(sp.env_facts(SNAP), None, snapshot_when="x", run_url="",
+                                 generated_at=datetime(2026, 9, 24, tzinfo=timezone.utc),
+                                 model_name=None, cleared=[])
+    assert "Cleared since last time" not in html
+
+
+@pytest.mark.asyncio
+async def test_status_snapshot_round_trips_through_the_real_db_layer(tmp_path, monkeypatch) -> None:
+    """Upsert/fetch-prior against a real temp SQLite DB, mirroring the published-page test."""
+    import sys
+
+    monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "t.db"))
+    sys.modules.pop("db", None)
+    import db as dbmod
+
+    await dbmod.init_db()
+    await dbmod.upsert_status_snapshot("2026-09-24", [{"name": "dev", "state": "degraded"}])
+    await dbmod.upsert_status_snapshot("2026-09-25", [{"name": "dev", "state": "healthy"}])
+    # re-running the same day overwrites, never its own baseline
+    await dbmod.upsert_status_snapshot("2026-09-25", [{"name": "dev", "state": "healthy"}])
+    prev = await dbmod.previous_status_snapshot("2026-09-25")
+    assert prev == [{"name": "dev", "state": "degraded"}]
+    assert await dbmod.previous_status_snapshot("2026-09-24") is None
+
+
+def test_status_page_keep_days_defaults_safely_on_non_numeric(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-integer SUSAN_STATUS_PAGE_KEEP_DAYS must not crash; fall back to 30 and clamp."""
+    monkeypatch.delenv("SUSAN_STATUS_PAGE_KEEP_DAYS", raising=False)
+    assert sp.status_page_keep_days() == 30
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_KEEP_DAYS", "abc")
+    assert sp.status_page_keep_days() == 30
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_KEEP_DAYS", "60")
+    assert sp.status_page_keep_days() == 60
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_KEEP_DAYS", "1000")
+    assert sp.status_page_keep_days() == 365
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_KEEP_DAYS", "0")
+    assert sp.status_page_keep_days() == 1
+
+
+@pytest.mark.asyncio
+async def test_latest_published_page_prefers_stable_slug_on_a_tie(tmp_path, monkeypatch) -> None:
+    """The stable env-status slug and a dated archive can be stamped with the same
+    created_at within one run; on a tie the stable slug must win so /status/latest
+    never resolves to an archive."""
+    import sys
+
+    from sqlalchemy import select
+
+    monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "t.db"))
+    sys.modules.pop("db", None)
+    import db as dbmod
+
+    await dbmod.init_db()
+    await dbmod.upsert_published_page("env-status", "env-status", "T", "<html>STABLE</html>")
+    await dbmod.upsert_published_page("env-status-2026-09-24", "env-status", "T", "<html>ARCHIVE</html>")
+
+    # stamp both with the same created_at so the secondary sort must decide
+    same = datetime(2026, 9, 24, 17, 0, tzinfo=timezone.utc)
+    async with dbmod.SessionLocal() as session:
+        for row in (await session.execute(select(dbmod.PublishedPage))).scalars().all():
+            row.created_at = same
+        await session.commit()
+
+    latest = await dbmod.latest_published_page("env-status")
+    assert latest is not None and latest["slug"] == "env-status" and latest["html"] == "<html>STABLE</html>"
+
+
+@pytest.mark.asyncio
+async def test_previous_status_snapshot_rejects_non_list_of_dicts(tmp_path, monkeypatch) -> None:
+    """A stored snapshot whose payload is valid JSON but not a list of dicts is treated
+    as absent rather than crashing cleared_facts."""
+    import sys
+
+    from sqlalchemy import select
+
+    monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "t.db"))
+    sys.modules.pop("db", None)
+    import db as dbmod
+
+    await dbmod.init_db()
+    await dbmod.upsert_status_snapshot("2026-09-23", [{"name": "dev", "state": "healthy"}])
+    assert await dbmod.previous_status_snapshot("2026-09-24") == [{"name": "dev", "state": "healthy"}]
+
+    # valid JSON, but not a list of dicts
+    async with dbmod.SessionLocal() as session:
+        row = (await session.execute(select(dbmod.StatusSnapshot))).scalars().first()
+        row.payload = '"not-a-list"'
+        await session.commit()
+    assert await dbmod.previous_status_snapshot("2026-09-24") is None
+
+    # a JSON list whose elements are not dicts is rejected too
+    async with dbmod.SessionLocal() as session:
+        row = (await session.execute(select(dbmod.StatusSnapshot))).scalars().first()
+        row.payload = '[1, 2, 3]'
+        await session.commit()
+    assert await dbmod.previous_status_snapshot("2026-09-24") is None

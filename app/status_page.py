@@ -42,7 +42,13 @@ from app.config import SUSAN_VOICE, logger
 from app.github_http import search_issues
 from app.slack_api import fetch_slack_channel_history_since, notify_user_ephemeral, post_message
 from app.weekly_context import strip_weekly_status_auto_post_flags
-from db import get_github_token, upsert_published_page
+from db import (
+    get_github_token,
+    previous_status_snapshot,
+    prune_published_pages,
+    upsert_published_page,
+    upsert_status_snapshot,
+)
 
 STATUS_REPO = "Frontier-One/cloud-infra"
 STATUS_WORKFLOW_FILE = "env-nightly.yml"
@@ -190,6 +196,35 @@ def facts_for_prompt(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+_CLEARED_NON_HEALTHY = frozenset({"degraded", "attention", "unmeasured"})
+
+
+def cleared_facts(current: list[dict[str, Any]], previous: list[dict[str, Any]] | None) -> list[str]:
+    """Environments non-healthy in the previous day's snapshot that are healthy now.
+
+    Pure arithmetic over the stored facts, not a model memory: cleared means the
+    state went from degraded/attention/unmeasured to healthy. No previous snapshot
+    clears nothing.
+    """
+    if not previous:
+        return []
+    prior = {r.get("name"): r.get("state") for r in previous}
+    out: list[str] = []
+    for r in current:
+        name = r.get("name")
+        if prior.get(name) in _CLEARED_NON_HEALTHY and r.get("state") == "healthy":
+            out.append(str(name))
+    return out
+
+
+def _snapshot_date_key(when: str) -> str:
+    """YYYY-MM-DD of the probe from its generated timestamp; today if unknown."""
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", when or "")
+    if m:
+        return m.group(1)
+    return datetime.now(timezone.utc).date().isoformat()
+
+
 # ── 3. narrative from our model, as strict JSON ────────────────────────────────────────
 
 _NARRATIVE_SCHEMA = cleandoc(
@@ -328,6 +363,15 @@ def _issues_budget() -> int:
 def _narrative_lookback_days() -> int:
     n = int((os.environ.get("SUSAN_STATUS_PAGE_LOOKBACK_DAYS") or "7").strip() or "7")
     return max(1, min(30, n))
+
+
+def status_page_keep_days() -> int:
+    raw = (os.environ.get("SUSAN_STATUS_PAGE_KEEP_DAYS") or "30").strip() or "30"
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 30
+    return max(1, min(365, n))
 
 
 async def gather_context(user: str, token: str) -> tuple[str, str]:
@@ -483,6 +527,7 @@ def render_cluster_table(rows: list[dict[str, Any]]) -> str:
 def render_status_page(
     rows: list[dict[str, Any]], narrative: dict[str, Any] | None, *,
     snapshot_when: str, run_url: str, generated_at: datetime, model_name: str | None,
+    cleared: list[str] | None = None,
 ) -> str:
     n = narrative or {}
     readings = n.get("environments") or {}
@@ -498,7 +543,7 @@ def render_status_page(
         f'<span class="ref">{_esc(b.get("ref") or "unfiled")}</span><p>{_esc(b.get("body"))}</p></div>'
         for b in (n.get("blockers") or [])
     )
-    cleared = "".join(f"<li>{_esc(c)}</li>" for c in (n.get("cleared") or []))
+    cleared_items = "".join(f"<li>{_esc(c)}</li>" for c in (cleared or []))
     watch = "".join(f"<li>{_esc(w)}</li>" for w in (n.get("watch") or []))
     narrative_note = "" if narrative else (
         '<div class="note"><b>Narrative unavailable this run.</b> The model did not return a readable '
@@ -523,7 +568,7 @@ def render_status_page(
 <div class="cards">{cards}</div></section>
 <section><h2>Cluster reachability</h2>{render_cluster_table(rows)}</section>
 <section><h2>What is holding us back</h2>
-{f'<div class="cleared"><b>Cleared since last time.</b><ul>{cleared}</ul></div>' if cleared else ''}
+{f'<div class="cleared"><b>Cleared since last time.</b><ul>{cleared_items}</ul></div>' if cleared_items else ''}
 <p class="sub">Ordered by what would change most if it were fixed. Written from the alert channels and the open roadmap issues of the last {_narrative_lookback_days()} days.</p>
 <div class="blockers">{blockers or '<p class="sub">No blockers named this run.</p>'}</div>
 {f'<h2 style="margin-top:34px">Worth watching</h2><ul class="sub">{watch}</ul>' if watch else ''}
@@ -536,8 +581,11 @@ def render_status_page(
 # ── 5. the command ────────────────────────────────────────────────────────────────────
 
 
-def _slug(now: datetime) -> str:
-    return "env-" + now.strftime("%Y-%m-%d-%H%M")
+STABLE_SLUG = "env-status"
+
+
+def _archive_slug(date_key: str) -> str:
+    return f"env-status-{date_key}"
 
 
 def slack_summary(rows: list[dict[str, Any]], narrative: dict[str, Any] | None, url: str) -> str:
@@ -590,6 +638,10 @@ async def process_status_page(
     when = (snap.get("status_json") or {}).get("generated") or snap.get("run_created_at") or ""
     alerts, issues = await gather_context(user, token)
 
+    date_key = _snapshot_date_key(when)
+    previous = await previous_status_snapshot(date_key)
+    cleared = cleared_facts(rows, previous)
+
     narrative = None
     model_name = None
     model_route = None
@@ -610,11 +662,15 @@ async def process_status_page(
 
     now = datetime.now(timezone.utc)
     page = render_status_page(rows, narrative, snapshot_when=str(when), run_url=snap.get("run_url") or "",
-                              generated_at=now, model_name=model_name if narrative else None)
-    slug = _slug(now)
-    await upsert_published_page(slug, PAGE_KIND, "Frontier One — Environment Status", page,
+                              generated_at=now, model_name=model_name if narrative else None, cleared=cleared)
+    await upsert_status_snapshot(date_key, rows)
+    await upsert_published_page(STABLE_SLUG, PAGE_KIND, "Frontier One — Environment Status", page,
                                 model_route=model_route, model_name=model_name)
-    url = page_url(slug)
+    await upsert_published_page(_archive_slug(date_key), PAGE_KIND, "Frontier One — Environment Status", page,
+                                model_route=model_route, model_name=model_name)
+    cutoff = now - timedelta(days=status_page_keep_days())
+    await prune_published_pages(PAGE_KIND, cutoff)
+    url = page_url(STABLE_SLUG)
     text = slack_summary(rows, narrative, url)
     if auto_publish:
         await post_message(channel, text, thread_ts=thread_ts, model_route=model_route, model_name=model_name)
