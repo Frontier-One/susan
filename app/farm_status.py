@@ -27,10 +27,6 @@ logger = logging.getLogger("susan")
 NOT_CONFIGURED = object()
 
 
-def farm_configured() -> bool:
-    return bool(os.environ.get("FARM_BASE_URL"))
-
-
 def issue_farm_configured() -> bool:
     return bool(os.environ.get("ISSUE_FARM_BASE_URL"))
 
@@ -72,6 +68,11 @@ def _esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _is_number(x: object) -> bool:
+    """True for a real number, not a bool (bool subclasses int and is rejected)."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
 def _work_item(item: object) -> str | None:
     """Render one in-flight item as `repo#n (123s)`, or None when malformed.
 
@@ -85,10 +86,10 @@ def _work_item(item: object) -> str | None:
     if not isinstance(name, str):
         return None
     elapsed = item.get("elapsed_s")
-    if "elapsed_s" in item and not isinstance(elapsed, (int, float)):
+    if "elapsed_s" in item and not _is_number(elapsed):
         return None
     escaped = _esc(name)
-    if isinstance(elapsed, (int, float)):
+    if _is_number(elapsed):
         return f"{escaped} ({elapsed:.0f}s)"
     return escaped
 
@@ -127,7 +128,7 @@ def _format_one(name: str, status: dict | None | object) -> str:
                 break
     if not isinstance(last_pass, list):
         problems.append("last_pass missing or not a list")
-    if not isinstance(uptime_s, (int, float)):
+    if not _is_number(uptime_s):
         problems.append("uptime_s missing or not a number")
     elif uptime_s <= 0:
         problems.append("uptime_s is not positive (farm freshly booted)")

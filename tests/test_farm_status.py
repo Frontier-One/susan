@@ -140,6 +140,25 @@ def test_zero_uptime_is_not_healthy() -> None:
     assert f"*{PR}*: up" not in text
 
 
+def test_boolean_uptime_is_rejected() -> None:
+    # bool subclasses int, so it must not be accepted as a number.
+    text = format_farm_status([(PR, _status(uptime_s=True))])
+
+    assert f"*{PR}*: problem" in text
+    assert "uptime_s missing or not a number" in text
+    assert f"*{PR}*: up" not in text
+
+
+def test_boolean_elapsed_is_rejected() -> None:
+    text = format_farm_status(
+        [(PR, _status(in_flight=[{"name": "owner/repo#1", "elapsed_s": True}]))]
+    )
+
+    assert f"*{PR}*: problem" in text
+    assert "malformed item" in text
+    assert f"*{PR}*: up" not in text
+
+
 def test_not_configured_distinct_from_unreachable() -> None:
     text = format_farm_status([(PR, NOT_CONFIGURED), (ISSUE, None)])
 

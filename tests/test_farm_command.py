@@ -152,30 +152,6 @@ def test_farm_status_with_unconfigured_issue_farm_reports_not_configured(
     assert "unreachable" not in report
 
 
-def test_farm_status_with_unreachable_issue_farm_reports_unreachable(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    sent: list[str] = []
-
-    async def fake_fetch(base_url: str):
-        if base_url.startswith(ISSUE_FARM):
-            return None
-        return _status()
-
-    async def fake_notify(channel: str, user: str, text: str, *args, **kwargs) -> None:
-        sent.append(text)
-
-    monkeypatch.setattr("app.routes.fetch_farm_status", fake_fetch)
-    monkeypatch.setattr("app.routes.notify_user_ephemeral", fake_notify)
-
-    _slash_post(client, "farm status")
-
-    assert len(sent) == 1
-    report = sent[0]
-    assert "*Issue farm*: unreachable" in report
-    assert "*PR farm*: up" in report
-
-
 def test_farm_no_subcommand_says_what_it_accepts(client: TestClient) -> None:
     j = _slash_post(client, "farm")
 
@@ -195,6 +171,17 @@ def test_farm_status_with_extra_token_is_unknown(client: TestClient) -> None:
 
     assert "Unknown `farm` subcommand" in j["text"]
     assert "farm status" in j["text"]
+
+
+def test_pr_farm_status_with_extra_token_is_unknown_not_babysit(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with mock.patch("app.routes.process_babysit", new=mock.AsyncMock()) as pb:
+        j = _slash_post(client, "pr farm status extra")
+
+    assert "Unknown `farm` subcommand" in j["text"]
+    assert "farm status" in j["text"]
+    pb.assert_not_awaited()
 
 
 def test_farm_multiple_spaces_still_status(

@@ -1225,7 +1225,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
 
     # `pr farm status` is a farm-status request, not a babysit; exclude it from
     # the babysit caret so it reaches the farm-status path below.
-    is_pr_farm_status = bool(re.match(r"pr\s+farm\s+status\s*$", text_lower))
+    is_pr_farm_status = bool(re.match(r"pr\s+farm\s+status\b", text_lower))
     if (text_lower.startswith("babysit") or text_lower.startswith("pr farm")) and not is_pr_farm_status:
         if not farm_configured():
             return JSONResponse(
@@ -1278,23 +1278,23 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
 
         async def run_farm_status():
             try:
-                farms: list[tuple[str, dict | None | object]] = []
                 configured: list[tuple[str, str]] = []
                 if farm_configured():
                     configured.append(("PR farm", _farm_url()))
-                else:
-                    farms.append(("PR farm", NOT_CONFIGURED))
                 if issue_farm_configured():
                     url = os.environ["ISSUE_FARM_BASE_URL"].rstrip("/")
                     configured.append(("Issue farm", url))
-                else:
-                    farms.append(("Issue farm", NOT_CONFIGURED))
 
                 results = await asyncio.gather(
                     *(fetch_farm_status(url) for _, url in configured)
                 )
-                for (name, _url), status in zip(configured, results):
-                    farms.append((name, status))
+                status_by_name = {
+                    name: status for (name, _url), status in zip(configured, results)
+                }
+                farms: list[tuple[str, dict | None | object]] = [
+                    (name, status_by_name.get(name, NOT_CONFIGURED))
+                    for name in ("PR farm", "Issue farm")
+                ]
 
                 await notify_user_ephemeral(
                     channel, user, format_farm_status(farms), None, response_url
