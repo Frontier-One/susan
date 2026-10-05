@@ -100,6 +100,7 @@ Run tests / checks (if you add them): `python -m py_compile app/*.py` is a minim
 - `/susan standups …` — Summarize daily standup notes from `#team-tech` (threads) for a date window
 - `/susan surface failures` / `what's failing` — Digest of failing CI/promote/cost alerts from configured alert channels
 - `/susan babysit` / `pr farm` — Trigger the dev-tools PR farm to babysit open PRs to green (needs `FARM_BASE_URL`)
+- `/susan farm status` — What the PR farm and issue farm are working on right now (needs `FARM_BASE_URL` and/or `ISSUE_FARM_BASE_URL`)
 - `POST /farm/event` (not a command, the farms call it): when a farm parks an issue on its author, parks a build after repeated timeouts, stops at capacity or leaves a PR green except for a human approval, Susan DMs the author and the day's Forseti and posts one line to `#team-tech-dev-alerts`. GitHub logins map to Slack through the `people` table of `policy/forseti-rotation.yaml` on dev-tools' default branch (cached 10 minutes); the same kind, repo and number inside 10 minutes is sent once. Needs `FARM_EVENT_TOKEN`
 - `/susan needs my review` / `surface reviews` — PRs and asks that need *your* review (alerts + `#team-tech`)
 - `/susan board status` · `board pack` · `board risks` · `board claims` · `customer ask <name>` · `roadmap <question>` · `roadmap add <decision>` — the **roadmap board** (see below)
@@ -171,7 +172,8 @@ the proposed field values go into the issue body for a human to set.
 | `GITHUB_BASE_BRANCH` | Optional | Default `main` |
 | `GITHUB_TOKEN` | Optional | **Shared PAT for all users** — see SECURITY.md |
 | `FARM_BASE_URL` | For `/susan babysit` | Base URL of the dev-tools PR farm HTTP trigger (e.g. `http://farm-host:8787`); enables the babysit command |
-| `FARM_SERVE_TOKEN` | Optional | Bearer token the farm requires on `POST /babysit` |
+| `ISSUE_FARM_BASE_URL` | For `/susan farm status` | Base URL of the issue farm's HTTP trigger (e.g. `http://issue-farm-host:8787`); enables the farm status command's issue-farm report |
+| `FARM_SERVE_TOKEN` | Optional | Bearer token the farms honour on `POST /babysit` and `GET /status` |
 | `FARM_EVENT_TOKEN` | For `POST /farm/event` | Bearer the farms send on `POST /farm/event` (park, timeout park, capacity stop, needs approval). Unset = every call is 401. See SECURITY.md |
 | `SUSAN_FARM_EVENT_CHANNEL` | Optional | Channel id for the one-line farm notice (default `C0BD2V0KPN2`, `#team-tech-dev-alerts`) |
 | `SUSAN_FARM_EVENT_GITHUB_USER` | Optional | Slack user id whose GitHub connect reads the Forseti rota for farm events when `GITHUB_TOKEN` is unset |

@@ -27,8 +27,14 @@ from db import (
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from app.babysit import farm_configured, process_babysit
+from app.babysit import _farm_url, farm_configured, process_babysit
 from app.farm_event import FarmEvent, bearer_ok, is_duplicate, process_farm_event
+from app.farm_status import (
+    NOT_CONFIGURED,
+    fetch_farm_status,
+    format_farm_status,
+    issue_farm_configured,
+)
 from app.config import ACTIONS, GITHUB_ACTIONS, GOOGLE_ACTIONS, logger
 from app.github_pickers import (
     post_github_repo_multi_summary_picker_ephemeral,
@@ -633,6 +639,7 @@ def _help_overview() -> list[str]:
         "• `/susan needs my review` — PRs and asks waiting on you\n"
         "• `/susan surface failures` — failing CI, promote, and cost alerts\n"
         "• `/susan babysit` — trigger the PR farm to babysit open PRs to green\n"
+        "• `/susan farm status` — what the PR farm and issue farm are working on now\n"
         "• `/susan board status` — roadmap digest from the GitHub Projects board\n"
         "• `/susan create issue in org/repo …` · `create a doc …` · `send email …`",
         "*More detail*\n"
@@ -1216,7 +1223,10 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             {"response_type": "ephemeral", "text": ROADMAP_ACKS[roadmap_kind]}
         )
 
-    if text_lower.startswith("babysit") or text_lower.startswith("pr farm"):
+    # `pr farm status` is a farm-status request, not a babysit; exclude it from
+    # the babysit caret so it reaches the farm-status path below.
+    is_pr_farm_status = bool(re.match(r"pr\s+farm\s+status\s*$", text_lower))
+    if (text_lower.startswith("babysit") or text_lower.startswith("pr farm")) and not is_pr_farm_status:
         if not farm_configured():
             return JSONResponse(
                 {
@@ -1253,6 +1263,62 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
             }
         )
 
+    if re.match(r"farm\b", text_lower) or is_pr_farm_status:
+        farm_help = (
+            "Susan accepts `farm status` — what the PR farm and issue farm are working "
+            "on right now. Try `/susan farm status`."
+        )
+        if not re.match(r"(?:farm|pr\s+farm)\s+status\s*$", text_lower):
+            return JSONResponse(
+                {
+                    "response_type": "ephemeral",
+                    "text": f"Unknown `farm` subcommand. {farm_help}",
+                }
+            )
+
+        async def run_farm_status():
+            try:
+                farms: list[tuple[str, dict | None | object]] = []
+                configured: list[tuple[str, str]] = []
+                if farm_configured():
+                    configured.append(("PR farm", _farm_url()))
+                else:
+                    farms.append(("PR farm", NOT_CONFIGURED))
+                if issue_farm_configured():
+                    url = os.environ["ISSUE_FARM_BASE_URL"].rstrip("/")
+                    configured.append(("Issue farm", url))
+                else:
+                    farms.append(("Issue farm", NOT_CONFIGURED))
+
+                results = await asyncio.gather(
+                    *(fetch_farm_status(url) for _, url in configured)
+                )
+                for (name, _url), status in zip(configured, results):
+                    farms.append((name, status))
+
+                await notify_user_ephemeral(
+                    channel, user, format_farm_status(farms), None, response_url
+                )
+            except Exception as e:
+                logger.exception("farm status task failed")
+                try:
+                    await notify_user_ephemeral(
+                        channel, user, f"Susan error (farm status): {str(e)}", None, response_url
+                    )
+                except Exception as e2:
+                    logger.error("Could not notify user after farm status error: %s", e2)
+
+        background_tasks.add_task(run_farm_status)
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": (
+                    "Got it — Susan is checking both farms. You’ll get the status here "
+                    "in a moment."
+                ),
+            }
+        )
+
     action = detect_action(text)
     if not action:
         return JSONResponse(
@@ -1264,7 +1330,7 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                     "`summarize prs`, `weekly status`, `prep me for a sales call with …`, "
                     "`standups`, `surface failures`, `needs my review`, "
                     "`board status`, `customer ask <name>`, `roadmap add …`, "
-                    "`actions` / `action items`, `babysit`, "
+                    "`actions` / `action items`, `babysit`, `farm status`, "
                     "or Granola-only: `granola` / `gn`."
                 ),
             }
