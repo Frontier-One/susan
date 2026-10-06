@@ -187,6 +187,7 @@ the proposed field values go into the issue body for a human to set.
 | `SUSAN_WEEKLY_EXTRA_CHANNELS` | Optional | Channel ids the weekly reads **in addition** to its own, comma-separated. Default is `#team-tech-standups,#team-tech-reviews` — the written standups and the review channel carry blockers and design decisions that never reach the main channel. Set to an empty string to read only the invoking channel. |
 | `SUSAN_STATUS_PAGE_TOKEN` | Required for `status page` | Shared secret in the page URL (`?k=…`). Without it the route is a 404 and the command refuses: the page carries codewords and private addresses. |
 | `SUSAN_STATUS_PAGE_LOOKBACK_DAYS` | Optional | Days of alert-channel traffic and roadmap issues fed to the narrative (default 7). |
+| `SUSAN_STATUS_PAGE_KEEP_DAYS` | Optional | Days of dated status-page archives to keep before pruning (default 30). |
 | `SUSAN_STATUS_PAGE_MAX_TOKENS` | Optional | Narrative completion budget (default 6000). |
 | `SUSAN_TECH_WEEKLY_CHANNEL_NAMES` | Optional | Channel name slugs (comma) that get GitHub metrics in weekly status; default `team-tech,software,security` |
 
