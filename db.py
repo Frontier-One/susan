@@ -1198,20 +1198,23 @@ async def latest_published_page(kind: str) -> dict | None:
                 "created_at": row.created_at, "model_route": row.model_route, "model_name": row.model_name}
 
 
-async def prune_published_pages(kind: str, older_than: datetime) -> int:
+async def prune_published_pages(kind: str, older_than: datetime,
+                                protected_slug: str | None = None) -> int:
     """Delete published pages of a kind whose created_at is strictly older than ``older_than``.
 
-    The stable env-status slug is never pruned so /status/latest cannot 404 even if
-    generation stops; the dated archives are what this prunes. Returns the number removed.
+    A page whose slug equals ``protected_slug`` is never pruned so that its ``latest``
+    cannot 404 even if generation stops. Returns the number removed.
     """
     from sqlalchemy import delete
 
     async with SessionLocal() as session:
-        q = delete(PublishedPage).where(
+        where = [
             PublishedPage.kind == kind,
-            PublishedPage.slug != "env-status",
             PublishedPage.created_at < older_than,
-        )
+        ]
+        if protected_slug is not None:
+            where.append(PublishedPage.slug != protected_slug)
+        q = delete(PublishedPage).where(*where)
         result = await session.execute(q)
         await session.commit()
         return result.rowcount or 0
@@ -1299,6 +1302,14 @@ async def previous_status_snapshot(before_key: str) -> list[dict] | None:
             payload = _json.loads(row.payload)
         except Exception:
             return None
-        if isinstance(payload, list) and all(isinstance(item, dict) for item in payload):
+        if (
+            isinstance(payload, list)
+            and all(
+                isinstance(item, dict)
+                and isinstance(item.get("name"), str)
+                and isinstance(item.get("state"), str)
+                for item in payload
+            )
+        ):
             return payload
         return None

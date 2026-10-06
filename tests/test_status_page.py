@@ -161,7 +161,7 @@ async def test_process_builds_stores_and_posts(monkeypatch: pytest.MonkeyPatch) 
     async def upsert(slug, kind, title, html, **kw):
         stored[f"slug:{slug}"] = {"kind": kind, "html": html, **kw}
 
-    async def prune(kind, older_than):
+    async def prune(kind, older_than, protected_slug=None):
         return 0
 
     posted: dict[str, object] = {}
@@ -246,7 +246,7 @@ async def test_process_cleared_list_is_computed_from_stored_facts(monkeypatch: p
     async def upsert(slug, kind, title, html, **kw):
         stored[f"slug:{slug}"] = {"kind": kind, "html": html, **kw}
 
-    async def prune(kind, older_than):
+    async def prune(kind, older_than, protected_slug=None):
         return 0
 
     async def notify(*a, **k):
@@ -391,12 +391,13 @@ async def test_stable_and_archive_publish_and_prune_through_the_real_db_layer(tm
         for r in rows:
             if r.slug == "env-status-2026-10-01":
                 r.created_at = now - timedelta(days=5)
-            elif r.slug == "env-status-2026-09-25":
-                r.created_at = now - timedelta(days=40)
+            else:
+                r.created_at = now - timedelta(days=40)   # backdate the stable slug too, so prune must spare it by rule
         await session.commit()
 
     # prune everything older than 30 days: only the 40-day-old archive goes
-    removed = await dbmod.prune_published_pages("env-status", now - timedelta(days=30))
+    removed = await dbmod.prune_published_pages("env-status", now - timedelta(days=30),
+                                                protected_slug="env-status")
     assert removed == 1
     assert await dbmod.get_published_page("env-status") is not None       # stable stays
     assert await dbmod.get_published_page("env-status-2026-10-01") is not None
@@ -404,7 +405,8 @@ async def test_stable_and_archive_publish_and_prune_through_the_real_db_layer(tm
 
     # a different kind is untouched
     await dbmod.upsert_published_page("weekly/foo", "weekly", "T", "<html>W</html>")
-    await dbmod.prune_published_pages("env-status", now - timedelta(days=365))
+    await dbmod.prune_published_pages("env-status", now - timedelta(days=365),
+                                      protected_slug="env-status")
     assert (await dbmod.get_published_page("weekly/foo")) is not None
 
 

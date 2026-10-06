@@ -219,7 +219,7 @@ def cleared_facts(current: list[dict[str, Any]], previous: list[dict[str, Any]] 
 
 def _snapshot_date_key(when: str) -> str:
     """YYYY-MM-DD of the probe from its generated timestamp; today if unknown."""
-    m = re.match(r"(\d{4}-\d{2}-\d{2})", when or "")
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", when if isinstance(when, str) else "")
     if m:
         y = m.group(1)
         try:
@@ -242,7 +242,6 @@ _NARRATIVE_SCHEMA = cleandoc(
         {"severity": "crit|warn", "title": "one line, the consequence not the mechanism",
          "ref": "issue/PR refs like #1563, or 'unfiled'", "body": "2-4 sentences: what is true, why it matters, what unblocks it"}
       ],
-      "cleared": ["things that were red last week and are verifiably fixed now, one line each"],
       "watch": ["one-line items that are not blockers yet but a lead should know"]
     }
     """
@@ -271,7 +270,6 @@ def _narrative_system_prompt() -> str:
           back, a customer-visible outage, or a security boundary open; warn = everything
           else worth a lead's attention. Cite the issue or PR when the alerts or issues
           give one; say "unfiled" when nothing owns it.
-        - "cleared" only for things the sources show as fixed, not things merely quiet.
         - AN ISSUE NUMBER IN THE ALERTS IS NOT PROOF IT IS STILL OPEN. The alert
           channels are a week of history and an issue named there may have been
           closed since. Before calling something a blocker on the strength of an
@@ -345,7 +343,6 @@ def parse_narrative(text: str) -> dict[str, Any] | None:
     d.setdefault("standfirst", "")
     d["environments"] = d.get("environments") if isinstance(d.get("environments"), dict) else {}
     d["blockers"] = [b for b in (d.get("blockers") or []) if isinstance(b, dict)]
-    d["cleared"] = [str(x) for x in (d.get("cleared") or []) if isinstance(x, (str, int, float))]
     d["watch"] = [str(x) for x in (d.get("watch") or []) if isinstance(x, (str, int, float))]
     return d
 
@@ -672,10 +669,13 @@ async def process_status_page(
     await upsert_status_snapshot(date_key, rows)
     await upsert_published_page(STABLE_SLUG, PAGE_KIND, "Frontier One — Environment Status", page,
                                 model_route=model_route, model_name=model_name, created_at=now)
+    # Archives are keyed by snapshot date; stamp created_at with that date so pruning
+    # by created_at cannot keep a stale-snapshot archive alive for another keep-window.
+    archive_created_at = datetime.strptime(date_key, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     await upsert_published_page(_archive_slug(date_key), PAGE_KIND, "Frontier One — Environment Status", page,
-                                model_route=model_route, model_name=model_name, created_at=now)
+                                model_route=model_route, model_name=model_name, created_at=archive_created_at)
     cutoff = now - timedelta(days=status_page_keep_days())
-    await prune_published_pages(PAGE_KIND, cutoff)
+    await prune_published_pages(PAGE_KIND, cutoff, protected_slug=STABLE_SLUG)
     url = page_url(STABLE_SLUG)
     text = slack_summary(rows, narrative, url)
     if auto_publish:
