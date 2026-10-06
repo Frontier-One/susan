@@ -137,7 +137,10 @@ async def fetch_latest_status_snapshot(token: str) -> dict[str, Any]:
         if arts[0].get("expired"):
             raise RuntimeError("the latest status artifact has expired (30-day retention)")
         r = await client.get(arts[0]["archive_download_url"], headers=hdrs)
-        r.raise_for_status()
+        # raise_for_status embeds GitHub's short-lived signed download URL in the raised
+        # error, which is logged and echoed to the caller; surface the run id instead.
+        if r.status_code >= 400:
+            raise RuntimeError(f"could not download the `{STATUS_ARTIFACT_NAME}` artifact for run {run.get('id')}")
         snap = extract_snapshot(r.content)
     snap["run_url"] = run.get("html_url", "")
     snap["run_created_at"] = run.get("created_at", "")
@@ -642,40 +645,47 @@ async def process_status_page(
     alerts, issues = await gather_context(user, token)
 
     date_key = _snapshot_date_key(when)
-    previous = await previous_status_snapshot(date_key)
-    cleared = cleared_facts(rows, previous)
-
     narrative = None
     model_name = None
     model_route = None
     try:
-        completion = await build_narrative(rows, alerts, issues, when)
-        narrative = parse_narrative(str(completion))
-        model_name = getattr(completion, "model_name", None)
-        model_route = getattr(completion, "model_route", None)
-        if narrative is None:
-            # Log what it actually said, truncated. "Did not parse" on its own is not
-            # diagnosable, and this failure has now cost two runs.
-            logger.warning(
-                "status page: narrative did not parse as JSON (model=%s); first 400 chars: %r",
-                getattr(completion, "model_name", "?"), str(completion)[:400],
-            )
-    except Exception as e:
-        logger.exception("status page: narrative failed: %s", e)
+        previous = await previous_status_snapshot(date_key)
+        cleared = cleared_facts(rows, previous)
 
-    now = datetime.now(timezone.utc)
-    page = render_status_page(rows, narrative, snapshot_when=str(when), run_url=snap.get("run_url") or "",
-                              generated_at=now, model_name=model_name if narrative else None, cleared=cleared)
-    await upsert_status_snapshot(date_key, rows)
-    await upsert_published_page(STABLE_SLUG, PAGE_KIND, "Frontier One — Environment Status", page,
-                                model_route=model_route, model_name=model_name, created_at=now)
-    # Archives are keyed by snapshot date; stamp created_at with that date so pruning
-    # by created_at cannot keep a stale-snapshot archive alive for another keep-window.
-    archive_created_at = datetime.strptime(date_key, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    await upsert_published_page(_archive_slug(date_key), PAGE_KIND, "Frontier One — Environment Status", page,
-                                model_route=model_route, model_name=model_name, created_at=archive_created_at)
-    cutoff = now - timedelta(days=status_page_keep_days())
-    await prune_published_pages(PAGE_KIND, cutoff, protected_slug=STABLE_SLUG)
+        try:
+            completion = await build_narrative(rows, alerts, issues, when)
+            narrative = parse_narrative(str(completion))
+            model_name = getattr(completion, "model_name", None)
+            model_route = getattr(completion, "model_route", None)
+            if narrative is None:
+                # Log what it actually said, truncated. "Did not parse" on its own is not
+                # diagnosable, and this failure has now cost two runs.
+                logger.warning(
+                    "status page: narrative did not parse as JSON (model=%s); first 400 chars: %r",
+                    getattr(completion, "model_name", "?"), str(completion)[:400],
+                )
+        except Exception as e:
+            logger.exception("status page: narrative failed: %s", e)
+
+        now = datetime.now(timezone.utc)
+        page = render_status_page(rows, narrative, snapshot_when=str(when), run_url=snap.get("run_url") or "",
+                                  generated_at=now, model_name=model_name if narrative else None, cleared=cleared)
+        await upsert_status_snapshot(date_key, rows)
+        await upsert_published_page(STABLE_SLUG, PAGE_KIND, "Frontier One — Environment Status", page,
+                                    model_route=model_route, model_name=model_name, created_at=now)
+        # Archives are keyed by snapshot date; stamp created_at with that date so pruning
+        # by created_at cannot keep a stale-snapshot archive alive for another keep-window.
+        archive_created_at = datetime.strptime(date_key, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        await upsert_published_page(_archive_slug(date_key), PAGE_KIND, "Frontier One — Environment Status", page,
+                                    model_route=model_route, model_name=model_name, created_at=archive_created_at)
+        cutoff = now - timedelta(days=status_page_keep_days())
+        await prune_published_pages(PAGE_KIND, cutoff, protected_slug=STABLE_SLUG)
+    except Exception as e:
+        # Do not publish a page or post to Slack when the snapshot could not be stored.
+        logger.exception("status page: could not store the page")
+        await notify_user_ephemeral(channel, user, f"Could not store the page: {e}", None, response_url)
+        return
+
     url = page_url(STABLE_SLUG)
     text = slack_summary(rows, narrative, url)
     if auto_publish:
