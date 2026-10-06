@@ -208,6 +208,81 @@ async def test_process_builds_stores_and_posts(monkeypatch: pytest.MonkeyPatch) 
     assert seen_cleared["stored"] == sp.env_facts(SNAP)       # today's facts are stored for tomorrow
 
 
+@pytest.mark.asyncio
+async def test_process_cleared_list_is_computed_from_stored_facts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-healthy environment that recovers is listed as cleared through the real entry point."""
+    from app.claude_client import ModelCompletion
+
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://susan.example")
+
+    # dev is degraded in SNAP; flip its data so env_facts derives a healthy state today.
+    current = {
+        "generated": SNAP["generated"],
+        "environments": {
+            **SNAP["environments"],
+            "dev": {
+                "apps": {"synced_healthy": 58, "drifted": 0, "progressing": 0, "degraded": 0, "missing": 0},
+                "clusters": {"control": "up", "asgard-cluster": "up", "spark-office": "up"},
+            },
+        },
+    }
+
+    async def token(user: str) -> str:
+        return "gh"
+
+    async def snap(tok: str) -> dict:
+        return {"status_json": current, "status_html": "", "run_url": "https://run", "run_created_at": "2026-09-24T04:40:00Z"}
+
+    async def ctx(user: str, tok: str) -> tuple[str, str]:
+        return "alerts…", "- cloud-infra#1563 [2026-09-24] scrape 401"
+
+    async def completion(system, user_prompt, **kw) -> ModelCompletion:
+        return ModelCompletion(json.dumps({"standfirst": "One sentence.", "environments": {}, "blockers": [], "cleared": [], "watch": []}),
+            model_route="sovereign", model_name="glm-5.3-flash")
+
+    stored: dict[str, object] = {}
+
+    async def upsert(slug, kind, title, html, **kw):
+        stored[f"slug:{slug}"] = {"kind": kind, "html": html, **kw}
+
+    async def prune(kind, older_than):
+        return 0
+
+    async def notify(*a, **k):
+        return None
+
+    async def post(channel, text, **kw):
+        return None
+
+    monkeypatch.setattr(sp, "get_github_token", token)
+    monkeypatch.setattr(sp, "fetch_latest_status_snapshot", snap)
+    monkeypatch.setattr(sp, "gather_context", ctx)
+    monkeypatch.setattr(sp, "call_claude", completion)
+    monkeypatch.setattr(sp, "upsert_published_page", upsert)
+    monkeypatch.setattr(sp, "post_message", post)
+    monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
+
+    async def prev(before_key: str):
+        return [{"name": "dev", "state": "degraded"}]
+
+    async def snap_store(key: str, payload: list) -> None:
+        return None
+
+    monkeypatch.setattr(sp, "previous_status_snapshot", prev)
+    monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
+    monkeypatch.setattr(sp, "prune_published_pages", prune)
+
+    await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
+
+    # the model named no cleared items; dev appears only because the facts arithmetic cleared it
+    stable = stored["slug:env-status"]
+    archive = stored["slug:env-status-2026-09-24"]
+    for page in (stable, archive):
+        assert "Cleared since last time" in str(page["html"])
+        assert "<li>dev</li>" in str(page["html"])
+
+
 def test_schedule_add_parses_status_page() -> None:
     from app.scheduler import parse_schedule_add
 
@@ -215,6 +290,14 @@ def test_schedule_add_parses_status_page() -> None:
                                 slash_channel_id="C1", slash_channel_name="general")
     assert parsed is not None and parsed.job_type == "status_page"
     assert (parsed.hour, parsed.minute) == (9, 0)
+
+
+def test_snapshot_date_key_requires_a_real_calendar_date() -> None:
+    """A malformed date like 2026-99-99 must fall back to today; a valid one is kept."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    assert sp._snapshot_date_key("2026-09-24T04:45:00Z") == "2026-09-24"
+    assert sp._snapshot_date_key("2026-99-99T04:45:00Z") == today
+    assert sp._snapshot_date_key("") == today
 
 
 def test_status_route_is_404_without_the_right_token(monkeypatch: pytest.MonkeyPatch) -> None:

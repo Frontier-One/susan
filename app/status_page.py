@@ -221,7 +221,13 @@ def _snapshot_date_key(when: str) -> str:
     """YYYY-MM-DD of the probe from its generated timestamp; today if unknown."""
     m = re.match(r"(\d{4}-\d{2}-\d{2})", when or "")
     if m:
-        return m.group(1)
+        y = m.group(1)
+        try:
+            parsed = datetime.strptime(y, "%Y-%m-%d")
+        except ValueError:
+            parsed = None
+        if parsed is not None and parsed.date().isoformat() == y:
+            return y
     return datetime.now(timezone.utc).date().isoformat()
 
 
@@ -665,9 +671,9 @@ async def process_status_page(
                               generated_at=now, model_name=model_name if narrative else None, cleared=cleared)
     await upsert_status_snapshot(date_key, rows)
     await upsert_published_page(STABLE_SLUG, PAGE_KIND, "Frontier One — Environment Status", page,
-                                model_route=model_route, model_name=model_name)
+                                model_route=model_route, model_name=model_name, created_at=now)
     await upsert_published_page(_archive_slug(date_key), PAGE_KIND, "Frontier One — Environment Status", page,
-                                model_route=model_route, model_name=model_name)
+                                model_route=model_route, model_name=model_name, created_at=now)
     cutoff = now - timedelta(days=status_page_keep_days())
     await prune_published_pages(PAGE_KIND, cutoff)
     url = page_url(STABLE_SLUG)

@@ -1161,10 +1161,11 @@ async def update_scheduled_job_after_run(
 async def upsert_published_page(
     slug: str, kind: str, title: str, html: str,
     *, model_route: str | None = None, model_name: str | None = None,
+    created_at: datetime | None = None,
 ) -> None:
     async with SessionLocal() as session:
         row = await session.get(PublishedPage, slug)
-        now = datetime.now(timezone.utc)
+        now = created_at if created_at is not None else datetime.now(timezone.utc)
         if row is None:
             session.add(PublishedPage(slug=slug, kind=kind, title=title, html=html,
                                       model_route=model_route, model_name=model_name, created_at=now))
@@ -1200,14 +1201,15 @@ async def latest_published_page(kind: str) -> dict | None:
 async def prune_published_pages(kind: str, older_than: datetime) -> int:
     """Delete published pages of a kind whose created_at is strictly older than ``older_than``.
 
-    The stable env-status slug is re-stamped on every run, so it is never older than
-    the cutoff; the dated archives are what this prunes. Returns the number removed.
+    The stable env-status slug is never pruned so /status/latest cannot 404 even if
+    generation stops; the dated archives are what this prunes. Returns the number removed.
     """
     from sqlalchemy import delete
 
     async with SessionLocal() as session:
         q = delete(PublishedPage).where(
             PublishedPage.kind == kind,
+            PublishedPage.slug != "env-status",
             PublishedPage.created_at < older_than,
         )
         result = await session.execute(q)
