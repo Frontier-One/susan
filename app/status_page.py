@@ -140,7 +140,7 @@ async def fetch_latest_status_snapshot(token: str) -> dict[str, Any]:
         # raise_for_status embeds GitHub's short-lived signed download URL in the raised
         # error, which is logged and echoed to the caller; surface the run id instead.
         if r.status_code >= 400:
-            raise RuntimeError(f"could not download the `{STATUS_ARTIFACT_NAME}` artifact for run {run.get('id')}")
+            raise RuntimeError(f"could not download the `{STATUS_ARTIFACT_NAME}` artifact for run {run.get('id')}: HTTP {r.status_code}")
         snap = extract_snapshot(r.content)
     snap["run_url"] = run.get("html_url", "")
     snap["run_created_at"] = run.get("created_at", "")
@@ -671,8 +671,6 @@ async def process_status_page(
         page = render_status_page(rows, narrative, snapshot_when=str(when), run_url=snap.get("run_url") or "",
                                   generated_at=now, model_name=model_name if narrative else None, cleared=cleared)
         await upsert_status_snapshot(date_key, rows)
-        await upsert_published_page(STABLE_SLUG, PAGE_KIND, "Frontier One — Environment Status", page,
-                                    model_route=model_route, model_name=model_name, created_at=now)
         # Archives are keyed by snapshot date; stamp created_at with that date so pruning
         # by created_at cannot keep a stale-snapshot archive alive for another keep-window.
         archive_created_at = datetime.strptime(date_key, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -680,10 +678,14 @@ async def process_status_page(
                                     model_route=model_route, model_name=model_name, created_at=archive_created_at)
         cutoff = now - timedelta(days=status_page_keep_days())
         await prune_published_pages(PAGE_KIND, cutoff, protected_slug=STABLE_SLUG)
+        # The stable slug is the exposed, Slack-linked URL, so it is committed last:
+        # an earlier failure must not leave the stable page live.
+        await upsert_published_page(STABLE_SLUG, PAGE_KIND, "Frontier One — Environment Status", page,
+                                    model_route=model_route, model_name=model_name, created_at=now)
     except Exception as e:
-        # Do not publish a page or post to Slack when the snapshot could not be stored.
-        logger.exception("status page: could not store the page")
-        await notify_user_ephemeral(channel, user, f"Could not store the page: {e}", None, response_url)
+        # Do not publish a page or post to Slack when the page could not be built or stored.
+        logger.exception("status page: could not build or store the page")
+        await notify_user_ephemeral(channel, user, f"Could not finish the status page (nothing was published): {e}", None, response_url)
         return
 
     url = page_url(STABLE_SLUG)
