@@ -295,7 +295,7 @@ def _stale_notice(snapshot_when: str, generated_at: datetime) -> str:
     feed = _parse_generated(snapshot_when)
     if feed is None:
         return ""
-    hours_old = (generated_at - feed).total_seconds() / 3600.0
+    hours_old = (_as_utc(generated_at) - feed).total_seconds() / 3600.0
     if hours_old <= STALE_AFTER_HOURS:
         return ""
     nights = max(1, round(hours_old / 24.0))
@@ -304,6 +304,20 @@ def _stale_notice(snapshot_when: str, generated_at: datetime) -> str:
         "this snapshot ran before last night's, so these figures are older than the latest "
         "nightly run and should not be read as fresh.</div>"
     )
+
+
+def _with_stale_notice(page_html: str, notice: str) -> str:
+    """A page carrying the stale notice, without re-rendering the facts it already holds.
+
+    Used when a run refuses to publish a staler snapshot: the live page keeps its fresher
+    content but gains the current notice, so a reader is not left to compare timestamps.
+    """
+    if not notice or notice in page_html:
+        return page_html
+    after = "<body>"
+    if after in page_html:
+        return page_html.replace(after, after + notice, 1)
+    return notice + page_html
 
 
 # ── 3. narrative from our model, as strict JSON ────────────────────────────────────────
@@ -749,7 +763,7 @@ async def process_status_page(
                                   run_completed_at=snap.get("run_completed_at") or None)
         # AC2: never replace a fresher published page with a staler snapshot. If the
         # snapshot this run fetched predates the live page's own generated stamp, refuse
-        # to publish anything and tell the user why, leaving the live page untouched.
+        # to publish the staler snapshot or its facts, and tell the user why.
         fetched_generated = _parse_generated((snap.get("status_json") or {}).get("generated"))
         live = await get_published_page(STABLE_SLUG)
         if refuses_stale_publish(fetched_generated, live.get("generated_at") if live else None):
@@ -761,6 +775,20 @@ async def process_status_page(
                 "so nothing was replaced. Time only moves forward on this page; run the nightly again when a "
                 "fresher snapshot exists.",
                 None, response_url)
+            # AC3: the still-live page must still tell a reader how stale its data is. Its
+            # own stale banner was computed at its original (fresh) render time, so persist
+            # a current notice on it. The build-time proxy is the live page's own
+            # generated_at, the time its snapshot's probe ran. The staler fetched snapshot's
+            # facts stay unpublished.
+            stale_notice = (
+                _stale_notice((snap.get("status_json") or {}).get("generated") or "", live.get("generated_at"))
+                if (live and live.get("generated_at")) else ""
+            )
+            await upsert_published_page(
+                STABLE_SLUG, PAGE_KIND, live.get("title") or "Frontier One — Environment Status",
+                _with_stale_notice(live["html"], stale_notice),
+                model_route=live.get("model_route"), model_name=live.get("model_name"),
+                created_at=live.get("created_at"), generated_at=live.get("generated_at"))
             return
         await upsert_status_snapshot(date_key, rows)
         # Archives are keyed by snapshot date; stamp created_at with that date so pruning
