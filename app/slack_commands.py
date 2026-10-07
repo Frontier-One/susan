@@ -105,6 +105,21 @@ SLACK_CB_EMAIL_MODAL = "susan_submit_email"
 SLACK_CB_INVITE_MODAL = "susan_submit_invite"
 
 
+def parse_retro_command(text: str) -> str | None:
+    """Return the command text for ``/susan retro <link>`` when it carries a valid Slack thread link.
+
+    Returns None (so handling falls through to the unknown-command path) when the
+    text does not start with ``retro`` or has no parsable archives link.
+    """
+    t = (text or "").strip()
+    if not re.match(r"retro\b", t, re.IGNORECASE):
+        return None
+    link_ch, link_ts = extract_slack_archives_link(t)
+    if not link_ch or not link_ts:
+        return None
+    return t
+
+
 def _looks_like_draft_id(value: str) -> bool:
     v = (value or "").strip()
     if len(v) != 36:

@@ -139,6 +139,13 @@ def extract_slack_archives_link(text: str) -> tuple[str | None, str | None]:
     return channel_id, ts
 
 
+def build_slack_message_permalink(channel: str, ts: str) -> str:
+    """Build a Slack message permalink from a channel id and message timestamp."""
+    digits = (ts or "").replace(".", "")
+    base = (os.environ.get("SUSAN_WORKSPACE_URL") or "https://frontier-one.slack.com").rstrip("/")
+    return f"{base}/archives/{channel}/p{digits}"
+
+
 def _is_public_slack_channel(channel_id: str) -> bool:
     """conversations.join is only valid for public channels (ids start with C)."""
     return bool(channel_id) and channel_id.upper().startswith("C")
@@ -259,7 +266,9 @@ async def _try_slack_join_channel(channel: str) -> None:
         logger.warning("Slack: conversations.join failed: %s", data)
 
 
-async def _fetch_slack_history_once(channel: str, thread_ts: str | None) -> dict:
+async def _fetch_slack_history_page(
+    channel: str, thread_ts: str | None, cursor: str | None
+) -> dict:
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
     params = {"channel": channel, "limit": 50}
     endpoint = (
@@ -269,20 +278,58 @@ async def _fetch_slack_history_once(channel: str, thread_ts: str | None) -> dict
     )
     if thread_ts:
         params["ts"] = thread_ts
+    if cursor:
+        params["cursor"] = cursor
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(endpoint, headers=headers, params=params)
     return r.json()
 
 
+# Ceiling on cursor-followed history pages, so a self-referential or glitched
+# next_cursor cannot turn a background fetch into an unbounded loop.
+MAX_HISTORY_PAGES = 100
+
+
+async def _fetch_slack_history_all(channel: str, thread_ts: str | None) -> dict:
+    """Fetch every message in a channel or thread, following next_cursor.
+
+    conversations.replies / conversations.history page at 50 messages. Without
+    following the cursor, a busy incident thread is silently cut to its first
+    50, which drops the tail of the discussion the retro workflow reads.
+
+    Cursor pagination only applies to threads; a channel-wide fetch keeps the
+    single 50-message page so a busy channel does not turn into an unbounded
+    paginated transcript.
+    """
+    collected: list[dict] = []
+    cursor: str | None = None
+    # Bounded pages: a self-referential or glitched next_cursor must not turn
+    # a background fetch into an unbounded loop hammering the Slack API.
+    for _ in range(MAX_HISTORY_PAGES):
+        data = await _fetch_slack_history_page(channel, thread_ts, cursor)
+        if not data.get("ok"):
+            return {
+                "ok": False,
+                "error": data.get("error", "unknown_error"),
+                "messages": collected,
+            }
+        batch = data.get("messages") or []
+        collected.extend(batch)
+        cursor = (data.get("response_metadata") or {}).get("next_cursor") or None
+        if not cursor or thread_ts is None:
+            return {"ok": True, "messages": collected}
+    return {"ok": True, "messages": collected}
+
+
 async def fetch_slack_history(
     channel: str, thread_ts: str | None, slack_user_id: str | None = None
 ) -> str:
-    data = await _fetch_slack_history_once(channel, thread_ts)
+    data = await _fetch_slack_history_all(channel, thread_ts)
     if not data.get("ok"):
         err = data.get("error", "unknown_error")
         if err in ("channel_not_found", "not_in_channel") and _is_public_slack_channel(channel):
             await _try_slack_join_channel(channel)
-            data = await _fetch_slack_history_once(channel, thread_ts)
+            data = await _fetch_slack_history_all(channel, thread_ts)
         elif (
             err in ("channel_not_found", "not_in_channel")
             and _is_dm_slack_channel(channel)
@@ -290,13 +337,13 @@ async def fetch_slack_history(
         ):
             new_ch = await _try_slack_open_im_with_user(slack_user_id)
             if new_ch:
-                data = await _fetch_slack_history_once(new_ch, thread_ts)
+                data = await _fetch_slack_history_all(new_ch, thread_ts)
         elif err in ("channel_not_found", "not_in_channel") and _is_private_or_mpim_slack_channel(
             channel
         ):
             new_ch = await _try_slack_open_by_channel_id(channel)
             if new_ch:
-                data = await _fetch_slack_history_once(new_ch, thread_ts)
+                data = await _fetch_slack_history_all(new_ch, thread_ts)
     if not data.get("ok"):
         err = data.get("error", "unknown_error")
         logger.error("Slack conversations API failed: %s full=%s", err, data)
@@ -344,6 +391,27 @@ async def _slack_conversations_replies_page(
             params=params,
         )
     return r.json()
+
+
+async def resolve_thread_root_ts(channel: str, ts: str) -> str:
+    """Resolve any message ts within a thread to the thread root ts.
+
+    conversations.replies returns the root message first, and every reply
+    carries a ``thread_ts`` equal to the root's ts. Idempotency for the manual
+    retro path is keyed on the root, so a permalink to a specific reply must
+    not become a distinct key. Falls back to the passed ts when the API call
+    fails or returns no usable ``thread_ts``, so the manual path still proceeds.
+    """
+    try:
+        data = await _slack_conversations_replies_page(channel, ts, None)
+    except Exception as e:  # noqa: BLE001 - never raise; manual path proceeds.
+        logger.warning("resolve_thread_root_ts failed for channel=%s ts=%s: %s", channel, ts, e)
+        return ts
+    for message in data.get("messages") or []:
+        root = message.get("thread_ts")
+        if root:
+            return str(root)
+    return ts
 
 
 async def _fetch_thread_reply_lines(
