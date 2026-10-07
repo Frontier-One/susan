@@ -706,7 +706,7 @@ def slack_summary(rows: list[dict[str, Any]], narrative: dict[str, Any] | None, 
 
 async def process_status_page(
     command_text: str, channel: str, user: str, thread_ts: str | None, response_url: str | None,
-    *, auto_publish: bool = False,
+    *, auto_publish: bool = False, now: datetime | None = None,
 ) -> None:
     _remainder, auto_flag = strip_weekly_status_auto_post_flags(parse_status_page_command(command_text) or "")
     auto_publish = auto_publish or auto_flag
@@ -756,7 +756,7 @@ async def process_status_page(
         except Exception as e:
             logger.exception("status page: narrative failed: %s", e)
 
-        now = datetime.now(timezone.utc)
+        now = now if now is not None else datetime.now(timezone.utc)
         page = render_status_page(rows, narrative, snapshot_when=str(when), run_url=snap.get("run_url") or "",
                                   generated_at=now, model_name=model_name if narrative else None, cleared=cleared,
                                   run_id=snap.get("run_id") or None,
@@ -764,7 +764,10 @@ async def process_status_page(
         # AC2: never replace a fresher published page with a staler snapshot. If the
         # snapshot this run fetched predates the live page's own generated stamp, refuse
         # to publish the staler snapshot or its facts, and tell the user why.
-        fetched_generated = _parse_generated((snap.get("status_json") or {}).get("generated"))
+        # Fall back to the run's own timestamp when status.json carries no generated
+        # stamp: run_created_at is a conservative lower bound on the snapshot's freshness
+        # claim, so a staler run with unmeasured data still cannot replace a fresher page.
+        fetched_generated = _parse_generated((snap.get("status_json") or {}).get("generated") or snap.get("run_created_at") or "")
         live = await get_published_page(STABLE_SLUG)
         if refuses_stale_publish(fetched_generated, live.get("generated_at") if live else None):
             live_when = (_as_utc(live["generated_at"]).isoformat() if (live and live.get("generated_at")) else "unknown")
@@ -781,14 +784,15 @@ async def process_status_page(
             # generated_at, the time its snapshot's probe ran. The staler fetched snapshot's
             # facts stay unpublished.
             stale_notice = (
-                _stale_notice((snap.get("status_json") or {}).get("generated") or "", live.get("generated_at"))
+                _stale_notice(live["generated_at"].isoformat(), now)
                 if (live and live.get("generated_at")) else ""
             )
             await upsert_published_page(
                 STABLE_SLUG, PAGE_KIND, live.get("title") or "Frontier One — Environment Status",
                 _with_stale_notice(live["html"], stale_notice),
                 model_route=live.get("model_route"), model_name=live.get("model_name"),
-                created_at=live.get("created_at"), generated_at=live.get("generated_at"))
+                created_at=live.get("created_at"), generated_at=live.get("generated_at"),
+                if_not_fresher_than=live["generated_at"] if live.get("generated_at") else None)
             return
         await upsert_status_snapshot(date_key, rows)
         # Archives are keyed by snapshot date; stamp created_at with that date so pruning
@@ -803,7 +807,8 @@ async def process_status_page(
         # an earlier failure must not leave the stable page live.
         await upsert_published_page(STABLE_SLUG, PAGE_KIND, "Frontier One — Environment Status", page,
                                     model_route=model_route, model_name=model_name, created_at=now,
-                                    generated_at=fetched_generated)
+                                    generated_at=fetched_generated,
+                                    if_not_fresher_than=fetched_generated)
     except Exception as e:
         # Do not publish a page or post to Slack when the page could not be built or stored.
         logger.exception("status page: could not build or store the page")

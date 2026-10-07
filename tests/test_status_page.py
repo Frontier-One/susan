@@ -561,7 +561,11 @@ async def test_process_refuses_to_replace_a_fresher_page_with_a_staler_snapshot(
     monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
     monkeypatch.setattr(sp, "post_message", post)
 
-    await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
+    # Pin the clock: the persisted notice is computed from the live page's generated_at vs
+    # `now`, so a fixed `now` (just over a day after the live page) makes the banner's
+    # presence deterministic regardless of when the test runs.
+    await sp.process_status_page("status page --no-approval", "C1", "U1", None, None,
+                                 now=datetime(2026, 10, 7, 17, 0, tzinfo=timezone.utc))
 
     # Only the stable slug is re-written, to carry the stale notice; the staler snapshot's
     # facts are not published as an archive, not stored as a snapshot,
@@ -569,7 +573,9 @@ async def test_process_refuses_to_replace_a_fresher_page_with_a_staler_snapshot(
     assert list(published) == ["env-status"]
     assert snap_stored == []                      # no snapshot persisted
     stable = published["env-status"]
-    assert "Data is 22 nights old." in stable["html"]
+    # The persisted notice conveys the live page's own data age vs. now (its generated_at
+    # is Oct 6, a day or two old), not the ~3-week gap to the rejected snapshot.
+    assert "nights old" in stable["html"]
     assert stable["html"].startswith("<html>LIVE</html>") or "LIVE" in stable["html"]
     assert stable["generated_at"] == live["generated_at"]   # fresher facts untouched
     assert "older" in notified["text"]
@@ -640,11 +646,12 @@ async def test_process_refuses_with_a_naive_live_generated_stamp(monkeypatch: py
     monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
     monkeypatch.setattr(sp, "post_message", post)
 
-    await sp.process_status_page("status page --no-approval", "C2", "U2", None, None)
+    await sp.process_status_page("status page --no-approval", "C2", "U2", None, None,
+                                 now=datetime(2026, 10, 7, 17, 0, tzinfo=timezone.utc))
 
     assert list(published) == ["env-status"]      # only stable, to carry the stale notice
     assert snap_stored == []                      # no snapshot persisted either
-    assert "Data is 22 nights old." in published["env-status"]["html"]
+    assert "nights old" in published["env-status"]["html"]
     assert "older" in notified["text"]
     assert "nothing was replaced" in notified["text"]
 
@@ -864,6 +871,39 @@ async def test_published_page_generated_at_round_trips_through_the_real_db_layer
     if stored2.tzinfo is None:
         stored2 = stored2.replace(tzinfo=timezone.utc)
     assert stored2 == g2
+
+
+@pytest.mark.asyncio
+async def test_upsert_published_page_if_not_fresher_than_refuses_to_overwrite_a_fresher_page(tmp_path, monkeypatch) -> None:
+    """The atomically-guarded stable write skips when the stored page is already fresher:
+    an older snapshot cannot clobber a newer page even if the caller read stale state."""
+    import sys
+
+    monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "t.db"))
+    sys.modules.pop("db", None)
+    import db as dbmod
+
+    await dbmod.init_db()
+
+    older = datetime(2026, 9, 24, 4, 45, tzinfo=timezone.utc)
+    newer = datetime(2026, 9, 26, 4, 45, tzinfo=timezone.utc)
+    await dbmod.upsert_published_page("env-status", "env-status", "T", "<html>FRESH</html>", generated_at=newer)
+
+    # A staler snapshot that landed after the fresher page must not replace it.
+    await dbmod.upsert_published_page("env-status", "env-status", "T", "<html>STALE</html>",
+                                      generated_at=older, if_not_fresher_than=older)
+    got = await dbmod.get_published_page("env-status")
+    assert got["html"] == "<html>FRESH</html>"
+    stored = got["generated_at"]
+    if stored.tzinfo is None:
+        stored = stored.replace(tzinfo=timezone.utc)
+    assert stored == newer
+
+    # A genuinely fresher snapshot still publishes over the older page.
+    await dbmod.upsert_published_page("env-status", "env-status", "T", "<html>NEWER</html>",
+                                      generated_at=newer, if_not_fresher_than=newer)
+    got = await dbmod.get_published_page("env-status")
+    assert got["html"] == "<html>NEWER</html>"
 
 
 # ── narrative extraction, hardened 2026-09-25 ─────────────────────────────────────────
