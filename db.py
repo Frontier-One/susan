@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
-from sqlalchemy import Boolean, String, Text, DateTime, Integer
+from sqlalchemy import Boolean, String, Text, DateTime, Integer, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -180,6 +180,18 @@ class RepoPickPending(Base):
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # create_all makes missing tables but does not ALTER existing ones, so a
+        # deployed published_pages that predates generated_at gains it here.
+        columns = {c["name"] for c in await conn.run_sync(
+            lambda sync_conn: inspect(sync_conn).get_columns("published_pages")
+        )}
+        if "generated_at" not in columns:
+            ddl = {"postgresql": "TIMESTAMPTZ"}.get(
+                engine.dialect.name, "DATETIME"
+            )
+            await conn.execute(
+                text(f"ALTER TABLE published_pages ADD COLUMN generated_at {ddl}")
+            )
 
 
 async def create_repo_pick_pending(
@@ -382,6 +394,9 @@ class PublishedPage(Base):
     model_route: Mapped[str | None] = mapped_column(String(40), nullable=True)
     model_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # The artifact's own `generated` stamp the page was built from, so a later run can
+    # refuse to replace a fresher published page with a staler snapshot.
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ScheduledJob(Base):
@@ -1162,16 +1177,19 @@ async def upsert_published_page(
     slug: str, kind: str, title: str, html: str,
     *, model_route: str | None = None, model_name: str | None = None,
     created_at: datetime | None = None,
+    generated_at: datetime | None = None,
 ) -> None:
     async with SessionLocal() as session:
         row = await session.get(PublishedPage, slug)
         now = created_at if created_at is not None else datetime.now(timezone.utc)
         if row is None:
             session.add(PublishedPage(slug=slug, kind=kind, title=title, html=html,
-                                      model_route=model_route, model_name=model_name, created_at=now))
+                                      model_route=model_route, model_name=model_name, created_at=now,
+                                      generated_at=generated_at))
         else:
             row.kind, row.title, row.html = kind, title, html
             row.model_route, row.model_name, row.created_at = model_route, model_name, now
+            row.generated_at = generated_at
         await session.commit()
 
 
@@ -1181,7 +1199,8 @@ async def get_published_page(slug: str) -> dict | None:
         if row is None:
             return None
         return {"slug": row.slug, "kind": row.kind, "title": row.title, "html": row.html,
-                "created_at": row.created_at, "model_route": row.model_route, "model_name": row.model_name}
+                "created_at": row.created_at, "model_route": row.model_route, "model_name": row.model_name,
+                "generated_at": row.generated_at}
 
 
 async def latest_published_page(kind: str) -> dict | None:
