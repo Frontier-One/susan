@@ -236,9 +236,15 @@ async def test_process_builds_stores_and_posts(monkeypatch: pytest.MonkeyPatch) 
     async def snap_store(key: str, payload: list) -> None:
         seen_cleared["stored"] = payload
 
+    async def none_live(slug: str):
+        return None
+
     monkeypatch.setattr(sp, "previous_status_snapshot", prev)
     monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
     monkeypatch.setattr(sp, "prune_published_pages", prune)
+    # farm/issue-39's process also reads the live page before publishing; no live page
+    # here (first publish), so the real DB must never be reached under this stub set.
+    monkeypatch.setattr(sp, "get_published_page", none_live)
 
     await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
 
@@ -316,9 +322,15 @@ async def test_process_cleared_list_is_computed_from_stored_facts(monkeypatch: p
     async def snap_store(key: str, payload: list) -> None:
         return None
 
+    async def none_live(slug: str):
+        return None
+
     monkeypatch.setattr(sp, "previous_status_snapshot", prev)
     monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
     monkeypatch.setattr(sp, "prune_published_pages", prune)
+    # farm/issue-39's process also reads the live page before publishing; no live page
+    # here (first publish), so the real DB must never be reached under this stub set.
+    monkeypatch.setattr(sp, "get_published_page", none_live)
 
     await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
 
@@ -1262,9 +1274,15 @@ async def test_process_orders_stable_slug_after_archive(monkeypatch: pytest.Monk
     monkeypatch.setattr(sp, "upsert_published_page", upsert)
     monkeypatch.setattr(sp, "post_message", notify)
     monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
+    async def none_live(slug: str):
+        return None
+
     monkeypatch.setattr(sp, "previous_status_snapshot", prev)
     monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
     monkeypatch.setattr(sp, "prune_published_pages", prune)
+    # farm/issue-39's process also reads the live page before publishing; no live page
+    # here (first publish), so the real DB must never be reached under this stub set.
+    monkeypatch.setattr(sp, "get_published_page", none_live)
 
     await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
 
