@@ -461,6 +461,13 @@ def test_cleared_facts_no_previous_snapshot_clears_nothing() -> None:
     assert sp.cleared_facts(sp.env_facts(SNAP), None) == []
 
 
+def test_cleared_facts_lists_env_recovered_from_unmeasured_to_healthy() -> None:
+    current = [{"name": "dev", "state": "healthy"}]
+    previous = [{"name": "dev", "state": "unmeasured"}]
+    # an environment the probe could not read last night that is healthy now counts as cleared.
+    assert sp.cleared_facts(current, previous) == ["dev"]
+
+
 def test_cleared_facts_purely_arithmetic_over_env_states() -> None:
     current = [
         {"name": "a", "state": "healthy"},
