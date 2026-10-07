@@ -743,6 +743,7 @@ async def process_status_page(
     narrative = None
     model_name = None
     model_route = None
+    stable_committed = False
     try:
         previous = await previous_status_snapshot(date_key)
         cleared = cleared_facts(rows, previous)
@@ -830,9 +831,17 @@ async def process_status_page(
         cutoff = now - timedelta(days=status_page_keep_days())
         await prune_published_pages(PAGE_KIND, cutoff, protected_slug=STABLE_SLUG)
     except Exception as e:
-        # Do not publish a page or post to Slack when the page could not be built or stored.
+        # Do not post to Slack when the page could not be built or stored. If the stable
+        # slug was already committed before a later snapshot/archive/prune step failed, the
+        # page is live, so say so instead of claiming nothing was published.
         logger.exception("status page: could not build or store the page")
-        await notify_user_ephemeral(channel, user, f"Could not finish the status page (nothing was published): {e}", None, response_url)
+        if stable_committed:
+            await notify_user_ephemeral(
+                channel, user,
+                f"The status page was published, but a follow-up step (snapshot, archive, or "
+                f"prune) failed: {e}", None, response_url)
+        else:
+            await notify_user_ephemeral(channel, user, f"Could not finish the status page (nothing was published): {e}", None, response_url)
         return
 
     url = page_url(STABLE_SLUG)

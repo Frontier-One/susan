@@ -1267,8 +1267,14 @@ async def test_process_failure_publishes_nothing_and_notifies(monkeypatch: pytes
 
     published: list[str] = []
 
+    upsert_called: list[str] = []
+
     async def fail_upsert(slug, *a, **k):
+        upsert_called.append(slug)
         raise RuntimeError("storage down")
+
+    async def none_live(slug: str):
+        return None
 
     async def prune(*a, **k):
         return 0
@@ -1288,6 +1294,7 @@ async def test_process_failure_publishes_nothing_and_notifies(monkeypatch: pytes
     monkeypatch.setattr(sp, "gather_context", ctx)
     monkeypatch.setattr(sp, "call_claude", completion)
     monkeypatch.setattr(sp, "upsert_published_page", fail_upsert)
+    monkeypatch.setattr(sp, "get_published_page", none_live)
     monkeypatch.setattr(sp, "post_message", post)
     monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
     monkeypatch.setattr(sp, "previous_status_snapshot", prev)
@@ -1296,9 +1303,81 @@ async def test_process_failure_publishes_nothing_and_notifies(monkeypatch: pytes
 
     await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
 
+    assert upsert_called == [sp.STABLE_SLUG]        # the injected page-write failure ran
     assert "called" not in posts                 # nothing posted to Slack
     assert published == []                        # stable slug never committed
     assert notified and "nothing was published" in notified[0]
+
+
+@pytest.mark.asyncio
+async def test_process_reports_late_failure_when_stable_committed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the stable slug is committed but a later step (snapshot/archive/prune) fails,
+    the user is told the page was published and which follow-up step failed, not that nothing
+    was published."""
+    from app.claude_client import ModelCompletion
+
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://susan.example")
+
+    async def token(user: str) -> str:
+        return "gh"
+
+    async def snap(tok: str) -> dict:
+        return {"status_json": SNAP, "status_html": "", "run_url": "https://run", "run_created_at": "2026-09-24T04:40:00Z"}
+
+    async def ctx(user: str, tok: str) -> tuple[str, str]:
+        return "", ""
+
+    async def completion(system, user_prompt, **kw) -> ModelCompletion:
+        return ModelCompletion(json.dumps({"standfirst": "One sentence.", "environments": {}, "blockers": [], "cleared": [], "watch": []}),
+            model_route="sovereign", model_name="glm-5.3-flash")
+
+    async def prev(before_key: str):
+        return None
+
+    async def fail_snap_store(key: str, payload: list) -> None:
+        raise RuntimeError("snapshot storage down")
+
+    async def none_live(slug: str):
+        return None
+
+    published: list[str] = []
+
+    async def commit_upsert(slug, *a, **k):
+        published.append(slug)
+        return True
+
+    async def prune(*a, **k):
+        return 0
+
+    posts: dict[str, object] = {}
+
+    async def post(channel, text, **kw):
+        posts["called"] = True
+
+    notified: list[str] = []
+
+    async def notify(channel, user, text, blocks=None, response_url=None, **kw):
+        notified.append(text)
+
+    monkeypatch.setattr(sp, "get_github_token", token)
+    monkeypatch.setattr(sp, "get_published_page", none_live)
+    monkeypatch.setattr(sp, "fetch_latest_status_snapshot", snap)
+    monkeypatch.setattr(sp, "gather_context", ctx)
+    monkeypatch.setattr(sp, "call_claude", completion)
+    monkeypatch.setattr(sp, "upsert_published_page", commit_upsert)
+    monkeypatch.setattr(sp, "post_message", post)
+    monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
+    monkeypatch.setattr(sp, "previous_status_snapshot", prev)
+    monkeypatch.setattr(sp, "upsert_status_snapshot", fail_snap_store)
+    monkeypatch.setattr(sp, "prune_published_pages", prune)
+
+    await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
+
+    assert sp.STABLE_SLUG in published              # stable slug was committed
+    assert "called" not in posts                     # nothing posted to Slack
+    assert notified and "was published" in notified[0]
+    assert "nothing was published" not in notified[0]
 
 
 @pytest.mark.asyncio
