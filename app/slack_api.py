@@ -285,16 +285,27 @@ async def _fetch_slack_history_page(
     return r.json()
 
 
+# Ceiling on cursor-followed history pages, so a self-referential or glitched
+# next_cursor cannot turn a background fetch into an unbounded loop.
+MAX_HISTORY_PAGES = 100
+
+
 async def _fetch_slack_history_all(channel: str, thread_ts: str | None) -> dict:
     """Fetch every message in a channel or thread, following next_cursor.
 
     conversations.replies / conversations.history page at 50 messages. Without
     following the cursor, a busy incident thread is silently cut to its first
     50, which drops the tail of the discussion the retro workflow reads.
+
+    Cursor pagination only applies to threads; a channel-wide fetch keeps the
+    single 50-message page so a busy channel does not turn into an unbounded
+    paginated transcript.
     """
     collected: list[dict] = []
     cursor: str | None = None
-    while True:
+    # Bounded pages: a self-referential or glitched next_cursor must not turn
+    # a background fetch into an unbounded loop hammering the Slack API.
+    for _ in range(MAX_HISTORY_PAGES):
         data = await _fetch_slack_history_page(channel, thread_ts, cursor)
         if not data.get("ok"):
             return {
@@ -305,8 +316,9 @@ async def _fetch_slack_history_all(channel: str, thread_ts: str | None) -> dict:
         batch = data.get("messages") or []
         collected.extend(batch)
         cursor = (data.get("response_metadata") or {}).get("next_cursor") or None
-        if not cursor:
+        if not cursor or thread_ts is None:
             return {"ok": True, "messages": collected}
+    return {"ok": True, "messages": collected}
 
 
 async def fetch_slack_history(

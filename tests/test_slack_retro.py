@@ -160,10 +160,11 @@ async def test_successful_dispatch_posts_kickoff_after_recording(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A successful dispatch records the retro first, then posts a single kickoff."""
+    order: list[str] = []
     retro_get = mock.AsyncMock(return_value=None)
-    post = mock.AsyncMock()
+    post = mock.AsyncMock(side_effect=lambda *a, **k: order.append("post"))
     dispatch = mock.AsyncMock(return_value=f"{RETRO_DISPATCH_SUCCESS_PREFIX}: {PERMALINK}")
-    create = mock.AsyncMock(return_value="rid-3")
+    create = mock.AsyncMock(side_effect=lambda *a, **k: order.append("create"))
     monkeypatch.setattr("app.retro.get_incident_retro", retro_get)
     monkeypatch.setattr("app.retro.post_message", post)
     monkeypatch.setattr("app.retro.dispatch_incident_retro", dispatch)
@@ -181,6 +182,7 @@ async def test_successful_dispatch_posts_kickoff_after_recording(
     assert call.args[0] == CHANNEL
     assert call.kwargs.get("thread_ts") == THREAD_TS
     assert "Outage postmortem" in call.args[1]
+    assert order == ["create", "post"]
 
 
 @pytest.mark.asyncio
