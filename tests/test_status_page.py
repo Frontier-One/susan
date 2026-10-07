@@ -152,6 +152,34 @@ def test_render_no_stale_banner_when_unparseable() -> None:
         assert "nights old" not in html
 
 
+def test_with_stale_notice_keeps_exactly_one_banner_across_repeated_refusals() -> None:
+    """A repeated refusal must not stack a second stale banner: the notice text grows nightly
+    ("Data is N nights old"), so exact-text dedup is not enough. Each insert replaces the old block,
+    leaving exactly one `.note` on the live page."""
+    base = "<html><body>LIVE CONTENT</body></html>"
+    notice_a = sp._stale_notice("2026-10-05T04:00:00Z",
+                                datetime(2026, 10, 7, 17, 0, tzinfo=timezone.utc))
+    notice_b = sp._stale_notice("2026-10-04T04:00:00Z",
+                                datetime(2026, 10, 7, 17, 0, tzinfo=timezone.utc))
+    assert notice_a != notice_b                      # the text changes night to night
+
+    once = sp._with_stale_notice(base, notice_a)
+    assert notice_a in once                          # "Data is 3 nights old."
+    assert once.count('<div class="note">') == 1
+
+    twice = sp._with_stale_notice(once, notice_b)
+    assert notice_b in twice                         # "Data is 4 nights old."
+    assert notice_a not in twice                     # the older banner was replaced, not stacked
+    assert twice.count('<div class="note">') == 1
+    assert "LIVE CONTENT" in twice
+
+
+def test_with_stale_notice_no_banner_when_empty() -> None:
+    """A fresh/unknown snapshot yields no notice, and the page is returned untouched."""
+    base = "<html><body>LIVE CONTENT</body></html>"
+    assert sp._with_stale_notice(base, "") == base
+
+
 def test_page_url_carries_the_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://susan.example/")
     monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok123")
@@ -207,6 +235,7 @@ async def test_process_builds_stores_and_posts(monkeypatch: pytest.MonkeyPatch) 
 
     async def upsert(slug, kind, title, html, **kw):
         stored[f"slug:{slug}"] = {"kind": kind, "html": html, **kw}
+        return True
 
     async def prune(kind, older_than, protected_slug=None):
         return 0
@@ -298,6 +327,7 @@ async def test_process_cleared_list_is_computed_from_stored_facts(monkeypatch: p
 
     async def upsert(slug, kind, title, html, **kw):
         stored[f"slug:{slug}"] = {"kind": kind, "html": html, **kw}
+        return True
 
     async def prune(kind, older_than, protected_slug=None):
         return 0
@@ -689,6 +719,7 @@ async def test_process_publishes_fresh_snapshot_even_when_an_older_page_is_live(
 
     async def upsert(slug, kind, title, html, **kw):
         published[slug] = kw
+        return True
 
     async def snap_store(key: str, payload: list) -> None:
         return None
@@ -757,6 +788,7 @@ async def test_process_stores_the_fetched_run_identity_in_the_page(monkeypatch: 
 
     async def upsert(slug, kind, title, html, **kw):
         stored_pages[slug] = html
+        return True
 
     async def snap_store(key: str, payload: list) -> None:
         return None
@@ -1230,13 +1262,13 @@ async def test_process_failure_publishes_nothing_and_notifies(monkeypatch: pytes
     async def prev(before_key: str):
         return None
 
-    async def fail_store(key: str, payload: list) -> None:
-        raise RuntimeError("storage down")
+    async def snap_store(key: str, payload: list) -> None:
+        return None
 
     published: list[str] = []
 
-    async def upsert(slug, *a, **k):
-        published.append(slug)
+    async def fail_upsert(slug, *a, **k):
+        raise RuntimeError("storage down")
 
     async def prune(*a, **k):
         return 0
@@ -1255,11 +1287,11 @@ async def test_process_failure_publishes_nothing_and_notifies(monkeypatch: pytes
     monkeypatch.setattr(sp, "fetch_latest_status_snapshot", snap)
     monkeypatch.setattr(sp, "gather_context", ctx)
     monkeypatch.setattr(sp, "call_claude", completion)
-    monkeypatch.setattr(sp, "upsert_published_page", upsert)
+    monkeypatch.setattr(sp, "upsert_published_page", fail_upsert)
     monkeypatch.setattr(sp, "post_message", post)
     monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
     monkeypatch.setattr(sp, "previous_status_snapshot", prev)
-    monkeypatch.setattr(sp, "upsert_status_snapshot", fail_store)
+    monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
     monkeypatch.setattr(sp, "prune_published_pages", prune)
 
     await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
@@ -1271,7 +1303,8 @@ async def test_process_failure_publishes_nothing_and_notifies(monkeypatch: pytes
 
 @pytest.mark.asyncio
 async def test_process_orders_stable_slug_after_archive(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The stable slug is committed last: an earlier failure cannot leave it live."""
+    """The guarded stable write runs before the date-keyed archive: if it loses the race to a
+    newer run, no stale archive or facts are persisted (and no stale summary is posted)."""
     from app.claude_client import ModelCompletion
 
     monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok")
@@ -1303,6 +1336,7 @@ async def test_process_orders_stable_slug_after_archive(monkeypatch: pytest.Monk
 
     async def upsert(slug, kind, title, html, **kw):
         upsert_order.append(slug)
+        return True
 
     async def notify(*a, **k):
         return None
@@ -1326,7 +1360,7 @@ async def test_process_orders_stable_slug_after_archive(monkeypatch: pytest.Monk
 
     await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
 
-    assert upsert_order == ["env-status-2026-09-24", "env-status"]
+    assert upsert_order == ["env-status", "env-status-2026-09-24"]
 
 
 @pytest.mark.asyncio

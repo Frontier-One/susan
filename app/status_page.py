@@ -306,14 +306,20 @@ def _stale_notice(snapshot_when: str, generated_at: datetime) -> str:
     )
 
 
+_NOTE_RE = re.compile(r'<div class="note">.*?</div>', re.DOTALL)
+
+
 def _with_stale_notice(page_html: str, notice: str) -> str:
-    """A page carrying the stale notice, without re-rendering the facts it already holds.
+    """A page carrying exactly one stale notice, without re-rendering the facts it holds.
 
     Used when a run refuses to publish a staler snapshot: the live page keeps its fresher
     content but gains the current notice, so a reader is not left to compare timestamps.
+    The notice text grows nightly, so an existing block is stripped before the new one is
+    inserted rather than deduped by exact text — the live page carries exactly one banner.
     """
-    if not notice or notice in page_html:
+    if not notice:
         return page_html
+    page_html = _NOTE_RE.sub("", page_html)
     after = "<body>"
     if after in page_html:
         return page_html.replace(after, after + notice, 1)
@@ -794,6 +800,26 @@ async def process_status_page(
                 created_at=live.get("created_at"), generated_at=live.get("generated_at"),
                 if_not_fresher_than=live["generated_at"] if live.get("generated_at") else None)
             return
+        # The stable slug is the exposed, Slack-linked URL and the atomic freshness guard
+        # (if_not_fresher_than) decides whether this run wins the race against a concurrent
+        # publisher. Commit it first and use its outcome: if a newer run already committed
+        # between our read of the live page and this write, the guard skips the write and
+        # this run's snapshot is staler than what is live — so persist none of its date-keyed
+        # facts or archive and post no stale summary for it.
+        stable_committed = await upsert_published_page(
+            STABLE_SLUG, PAGE_KIND, "Frontier One — Environment Status", page,
+            model_route=model_route, model_name=model_name, created_at=now,
+            generated_at=fetched_generated, if_not_fresher_than=fetched_generated)
+        if not stable_committed:
+            live_winner = await get_published_page(STABLE_SLUG)
+            winner_when = (_as_utc(live_winner["generated_at"]).isoformat()
+                           if live_winner and live_winner.get("generated_at") else "unknown")
+            await notify_user_ephemeral(
+                channel, user,
+                f"A newer run already published the status page ({winner_when}) before this "
+                "run's write landed, so this run's snapshot was not published or stored.",
+                None, response_url)
+            return
         await upsert_status_snapshot(date_key, rows)
         # Archives are keyed by snapshot date; stamp created_at with that date so pruning
         # by created_at cannot keep a stale-snapshot archive alive for another keep-window.
@@ -803,12 +829,6 @@ async def process_status_page(
                                     generated_at=fetched_generated)
         cutoff = now - timedelta(days=status_page_keep_days())
         await prune_published_pages(PAGE_KIND, cutoff, protected_slug=STABLE_SLUG)
-        # The stable slug is the exposed, Slack-linked URL, so it is committed last:
-        # an earlier failure must not leave the stable page live.
-        await upsert_published_page(STABLE_SLUG, PAGE_KIND, "Frontier One — Environment Status", page,
-                                    model_route=model_route, model_name=model_name, created_at=now,
-                                    generated_at=fetched_generated,
-                                    if_not_fresher_than=fetched_generated)
     except Exception as e:
         # Do not publish a page or post to Slack when the page could not be built or stored.
         logger.exception("status page: could not build or store the page")

@@ -1290,8 +1290,8 @@ async def upsert_published_page(
     created_at: datetime | None = None,
     generated_at: datetime | None = None,
     if_not_fresher_than: datetime | None = None,
-) -> None:
-    """Store ``html`` as the published page for ``slug``.
+) -> bool:
+    """Store ``html`` as the published page for ``slug``; return True if the write committed.
 
     When ``if_not_fresher_than`` is given, the write is made conditionally and atomically:
     it is skipped if the row already holds a ``generated_at`` that is strictly newer
@@ -1300,12 +1300,16 @@ async def upsert_published_page(
     read of the page and its write (a TOCTOU race), so a staler snapshot cannot overwrite
     a fresher one. The read, comparison and write happen in one transaction (with a row
     lock where the backend supports it).
+
+    Returns False when the guarded write was skipped because the stored page is already
+    fresher, so a caller can suppress side effects that would otherwise be stale. Returns
+    True when the row was created or updated.
     """
     async with SessionLocal() as session:
         row = await session.get(PublishedPage, slug, with_for_update=True)
         if if_not_fresher_than is not None and row is not None and row.generated_at is not None:
             if _as_utc_aware(row.generated_at) > _as_utc_aware(if_not_fresher_than):
-                return
+                return False
         now = created_at if created_at is not None else datetime.now(timezone.utc)
         if row is None:
             session.add(PublishedPage(slug=slug, kind=kind, title=title, html=html,
@@ -1316,6 +1320,7 @@ async def upsert_published_page(
             row.model_route, row.model_name, row.created_at = model_route, model_name, now
             row.generated_at = generated_at
         await session.commit()
+        return True
 
 
 async def get_published_page(slug: str) -> dict | None:
