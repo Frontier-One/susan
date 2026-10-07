@@ -353,6 +353,27 @@ async def _slack_conversations_replies_page(
     return r.json()
 
 
+async def resolve_thread_root_ts(channel: str, ts: str) -> str:
+    """Resolve any message ts within a thread to the thread root ts.
+
+    conversations.replies returns the root message first, and every reply
+    carries a ``thread_ts`` equal to the root's ts. Idempotency for the manual
+    retro path is keyed on the root, so a permalink to a specific reply must
+    not become a distinct key. Falls back to the passed ts when the API call
+    fails or returns no usable ``thread_ts``, so the manual path still proceeds.
+    """
+    try:
+        data = await _slack_conversations_replies_page(channel, ts, None)
+    except Exception as e:  # noqa: BLE001 - never raise; manual path proceeds.
+        logger.warning("resolve_thread_root_ts failed for channel=%s ts=%s: %s", channel, ts, e)
+        return ts
+    for message in data.get("messages") or []:
+        root = message.get("thread_ts")
+        if root:
+            return str(root)
+    return ts
+
+
 async def _fetch_thread_reply_lines(
     channel: str,
     thread_ts: str,

@@ -15,6 +15,7 @@ from app.slack_api import (
     fetch_slack_history,
     notify_user_ephemeral,
     post_message,
+    resolve_thread_root_ts,
 )
 
 _RETRO_SECTIONS = (
@@ -92,9 +93,13 @@ async def process_retro_command(
         )
         return
     thread_text = await fetch_slack_history(link_ch, link_ts, user)
+    # Resolve the pasted message (which may be a reply) to its thread root so
+    # the idempotency key and post target are the same key the automatic path
+    # uses, and two permalinks for one thread cannot start two retros.
+    root_ts = await resolve_thread_root_ts(link_ch, link_ts)
     result = await start_retro(
         channel=link_ch,
-        thread_root_ts=link_ts,
+        thread_root_ts=root_ts,
         permalink=permalink,
         thread_text=thread_text,
         slack_user_id=user,

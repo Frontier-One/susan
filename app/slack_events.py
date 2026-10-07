@@ -8,7 +8,12 @@ from db import get_digest_for_thread, get_incident_retro, list_active_action_ite
 from app.action_items import apply_status_reply_with_claude, format_status_ack
 from app.config import logger
 from app.retro import start_retro
-from app.slack_api import build_slack_message_permalink, fetch_slack_history, post_ephemeral
+from app.slack_api import (
+    build_slack_message_permalink,
+    fetch_slack_history,
+    post_ephemeral,
+    post_message,
+)
 
 
 def _carries_resolved_marker(text: str) -> bool:
@@ -37,7 +42,13 @@ async def _maybe_start_retro(channel: str, user: str, text: str, thread_ts: str)
     history = await _fetch_thread_history(channel, thread_ts, user)
     if not history or not _history_carries_outage_marker(history):
         return
-    if await get_incident_retro(channel, thread_ts):
+    existing = await get_incident_retro(channel, thread_ts)
+    if existing:
+        await post_message(
+            channel,
+            f"Retro already started: {existing['permalink']}",
+            thread_ts=thread_ts,
+        )
         return
     permalink = build_slack_message_permalink(channel, thread_ts)
     result = await start_retro(

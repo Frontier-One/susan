@@ -14,12 +14,15 @@ from unittest import mock
 import pytest
 from fastapi.testclient import TestClient
 
+import db
+
 from app.retro import dispatch_incident_retro
 from app.slack_events import handle_slack_event_callback
 from app.retro import process_retro_command, start_retro
 
 CHANNEL = "C12345"
 THREAD_TS = "1712345678.123456"
+ROOT_TS = "1712345678.000000"
 PERMALINK = f"https://frontier-one.slack.com/archives/{CHANNEL}/p1712345678123456"
 
 
@@ -57,6 +60,7 @@ def _stub_event_leaves(monkeypatch: pytest.MonkeyPatch) -> dict:
     monkeypatch.setattr("app.slack_events.get_incident_retro", event_get)
     monkeypatch.setattr("app.retro.get_incident_retro", retro_get)
     monkeypatch.setattr("app.retro.post_message", post)
+    monkeypatch.setattr("app.slack_events.post_message", post)
     monkeypatch.setattr("app.retro.dispatch_incident_retro", dispatch)
     monkeypatch.setattr("app.retro.create_incident_retro", create)
     return {"fetch": fetch, "event_get": event_get, "retro_get": retro_get,
@@ -97,8 +101,13 @@ async def test_second_resolved_does_not_dispatch_again(monkeypatch: pytest.Monke
     await handle_slack_event_callback(_resolved_reply_payload())
 
     mocks["dispatch"].assert_not_awaited()
-    mocks["post"].assert_not_awaited()
     mocks["create"].assert_not_awaited()
+    # The automatic path posts the existing retro's link into the thread.
+    mocks["post"].assert_awaited_once()
+    call = mocks["post"].await_args
+    assert call.args[0] == CHANNEL
+    assert call.kwargs.get("thread_ts") == THREAD_TS
+    assert call.args[1] == f"Retro already started: {PERMALINK}"
 
 
 @pytest.mark.asyncio
@@ -325,6 +334,7 @@ async def test_process_retro_command_drives_orchestrator(
     post = mock.AsyncMock()
     dispatch = mock.AsyncMock(return_value=f"Retro started: {PERMALINK}")
     create = mock.AsyncMock(return_value="rid-2")
+    resolve_root = mock.AsyncMock(return_value=ROOT_TS)
 
     monkeypatch.setattr("app.retro.fetch_slack_history", fetch)
     monkeypatch.setattr("app.retro.notify_user_ephemeral", notify)
@@ -332,14 +342,87 @@ async def test_process_retro_command_drives_orchestrator(
     monkeypatch.setattr("app.retro.post_message", post)
     monkeypatch.setattr("app.retro.dispatch_incident_retro", dispatch)
     monkeypatch.setattr("app.retro.create_incident_retro", create)
+    monkeypatch.setattr("app.retro.resolve_thread_root_ts", resolve_root)
 
     await process_retro_command(PERMALINK, "C1", "U1", "resp-url")
 
     fetch.assert_awaited_once_with(CHANNEL, THREAD_TS, "U1")
+    # The pasted permalink ts is resolved to the thread root before use.
+    resolve_root.assert_awaited_once_with(CHANNEL, THREAD_TS)
     dispatch.assert_awaited_once()
     call = dispatch.await_args
     assert call.kwargs["channel"] == CHANNEL
-    assert call.kwargs["thread_ts"] == THREAD_TS
+    # The resolved root, not the pasted reply ts, is the idempotency key and
+    # the thread_ts dispatched, so it matches the automatic path's root key.
+    assert call.kwargs["thread_ts"] == ROOT_TS
     assert call.kwargs["permalink"] == PERMALINK
     notify.assert_awaited_once()
     assert notify.await_args.args[2] == f"Retro started: {PERMALINK}"
+
+
+@pytest.mark.asyncio
+async def test_resolve_thread_root_ts_uses_reply_thread_ts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A permalink to a reply resolves to the root's ts via thread_ts.
+    replies = mock.AsyncMock(
+        return_value={
+            "ok": True,
+            "messages": [
+                {"ts": ROOT_TS, "user": "U1"},
+                {"ts": THREAD_TS, "thread_ts": ROOT_TS, "user": "U2"},
+            ],
+        }
+    )
+    monkeypatch.setattr("app.slack_api._slack_conversations_replies_page", replies)
+
+    from app.slack_api import resolve_thread_root_ts
+
+    assert await resolve_thread_root_ts(CHANNEL, THREAD_TS) == ROOT_TS
+    replies.assert_awaited_once_with(CHANNEL, THREAD_TS, None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_thread_root_ts_falls_back_to_passed_ts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A message that is itself the root has no thread_ts anywhere.
+    replies = mock.AsyncMock(
+        return_value={
+            "ok": True,
+            "messages": [{"ts": THREAD_TS, "user": "U1"}],
+        }
+    )
+    monkeypatch.setattr("app.slack_api._slack_conversations_replies_page", replies)
+
+    from app.slack_api import resolve_thread_root_ts
+
+    assert await resolve_thread_root_ts(CHANNEL, THREAD_TS) == THREAD_TS
+
+
+@pytest.mark.asyncio
+async def test_resolve_thread_root_ts_api_failure_returns_passed_ts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A failed API call must not raise; the manual path proceeds with the key.
+    replies = mock.AsyncMock(side_effect=RuntimeError("nope"))
+    monkeypatch.setattr("app.slack_api._slack_conversations_replies_page", replies)
+
+    from app.slack_api import resolve_thread_root_ts
+
+    assert await resolve_thread_root_ts(CHANNEL, THREAD_TS) == THREAD_TS
+
+
+@pytest.mark.asyncio
+async def test_incident_retro_db_round_trip() -> None:
+    await db.init_db()
+    channel_id = "C-retro-test"
+    thread_root_ts = THREAD_TS
+    permalink = PERMALINK
+
+    retro_id = await db.create_incident_retro(channel_id, thread_root_ts, permalink)
+    assert retro_id
+
+    found = await db.get_incident_retro(channel_id, thread_root_ts)
+    assert found is not None
+    assert found["permalink"] == permalink
