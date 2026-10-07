@@ -20,7 +20,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
-from sqlalchemy import Boolean, String, Text, DateTime, Integer, inspect, text
+from sqlalchemy import (
+    Boolean,
+    String,
+    Text,
+    DateTime,
+    Integer,
+    inspect,
+    text,
+    UniqueConstraint,
+)
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -295,6 +305,19 @@ class UserDraftPending(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class IncidentRetro(Base):
+    """A started incident postmortem; at most one per outage thread (idempotency)."""
+
+    __tablename__ = "incident_retros"
+    __table_args__ = (UniqueConstraint("channel_id", "thread_root_ts", name="uq_incident_retros_thread"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    channel_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    thread_root_ts: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    permalink: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class ActionItemDigest(Base):
     """Posted action-item roundup in a channel; thread replies update tracked items."""
 
@@ -493,6 +516,67 @@ async def get_digest_for_thread(channel_id: str, thread_ts: str) -> dict | None:
             "until_d": row.until_d,
             "created_at": row.created_at.isoformat(),
         }
+
+
+async def get_incident_retro(channel_id: str, thread_root_ts: str) -> dict | None:
+    """The one retro started for a thread, if any (idempotency key)."""
+    async with SessionLocal() as session:
+        from sqlalchemy import select
+
+        q = (
+            select(IncidentRetro)
+            .where(
+                IncidentRetro.channel_id == channel_id,
+                IncidentRetro.thread_root_ts == thread_root_ts,
+            )
+            .order_by(IncidentRetro.created_at.desc())
+            .limit(1)
+        )
+        row = (await session.execute(q)).scalar_one_or_none()
+        if not row:
+            return None
+        return {
+            "id": row.id,
+            "channel_id": row.channel_id,
+            "thread_root_ts": row.thread_root_ts,
+            "permalink": row.permalink,
+            "created_at": row.created_at.isoformat(),
+        }
+
+
+async def create_incident_retro(channel_id: str, thread_root_ts: str, permalink: str) -> str:
+    rid = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        session.add(
+            IncidentRetro(
+                id=rid,
+                channel_id=channel_id,
+                thread_root_ts=thread_root_ts,
+                permalink=permalink,
+                created_at=now,
+            )
+        )
+        try:
+            await session.commit()
+        except IntegrityError:
+            # Another writer already started a retro for this thread; reuse it.
+            await session.rollback()
+            from sqlalchemy import select
+            q = (
+                select(IncidentRetro.id)
+                .where(
+                    IncidentRetro.channel_id == channel_id,
+                    IncidentRetro.thread_root_ts == thread_root_ts,
+                )
+                .order_by(IncidentRetro.created_at.desc())
+                .limit(1)
+            )
+            existing_id = (await session.execute(q)).scalar_one_or_none()
+            if existing_id:
+                return existing_id
+            return rid
+    return rid
 
 
 async def list_action_items_for_sheet(channel_id: str) -> list[dict]:

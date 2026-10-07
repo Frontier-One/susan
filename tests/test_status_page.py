@@ -6,6 +6,7 @@ import json
 import zipfile
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 
 import app.status_page as sp
@@ -1148,3 +1149,171 @@ async def test_fetch_latest_status_snapshot_reads_the_selected_runs_artifact(mon
     assert snap["run_completed_at"] == "2026-09-24T04:52:00Z"
     assert snap["status_json"] == run_b_json                  # content of the selected run's artifact
     assert snap["status_html"] == "<html>RUN_B</html>"
+# ── hardening 2026-09-25: failure phase and ordering ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_process_failure_publishes_nothing_and_notifies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When storing the page fails, no Slack post goes out and the stable slug is not
+    committed; the user is told nothing was published."""
+    from app.claude_client import ModelCompletion
+
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://susan.example")
+
+    async def token(user: str) -> str:
+        return "gh"
+
+    async def snap(tok: str) -> dict:
+        # "generated" from the module-level SNAP drives the archived slug env-status-2026-09-24.
+        return {"status_json": SNAP, "status_html": "", "run_url": "https://run", "run_created_at": "2026-09-24T04:40:00Z"}
+
+    async def ctx(user: str, tok: str) -> tuple[str, str]:
+        return "", ""
+
+    async def completion(system, user_prompt, **kw) -> ModelCompletion:
+        return ModelCompletion(json.dumps({"standfirst": "One sentence.", "environments": {}, "blockers": [], "cleared": [], "watch": []}),
+            model_route="sovereign", model_name="glm-5.3-flash")
+
+    async def prev(before_key: str):
+        return None
+
+    async def fail_store(key: str, payload: list) -> None:
+        raise RuntimeError("storage down")
+
+    published: list[str] = []
+
+    async def upsert(slug, *a, **k):
+        published.append(slug)
+
+    async def prune(*a, **k):
+        return 0
+
+    posts: dict[str, object] = {}
+
+    async def post(channel, text, **kw):
+        posts["called"] = True
+
+    notified: list[str] = []
+
+    async def notify(channel, user, text, blocks=None, response_url=None, **kw):
+        notified.append(text)
+
+    monkeypatch.setattr(sp, "get_github_token", token)
+    monkeypatch.setattr(sp, "fetch_latest_status_snapshot", snap)
+    monkeypatch.setattr(sp, "gather_context", ctx)
+    monkeypatch.setattr(sp, "call_claude", completion)
+    monkeypatch.setattr(sp, "upsert_published_page", upsert)
+    monkeypatch.setattr(sp, "post_message", post)
+    monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
+    monkeypatch.setattr(sp, "previous_status_snapshot", prev)
+    monkeypatch.setattr(sp, "upsert_status_snapshot", fail_store)
+    monkeypatch.setattr(sp, "prune_published_pages", prune)
+
+    await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
+
+    assert "called" not in posts                 # nothing posted to Slack
+    assert published == []                        # stable slug never committed
+    assert notified and "nothing was published" in notified[0]
+
+
+@pytest.mark.asyncio
+async def test_process_orders_stable_slug_after_archive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stable slug is committed last: an earlier failure cannot leave it live."""
+    from app.claude_client import ModelCompletion
+
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://susan.example")
+
+    async def token(user: str) -> str:
+        return "gh"
+
+    async def snap(tok: str) -> dict:
+        return {"status_json": SNAP, "status_html": "", "run_url": "https://run", "run_created_at": "2026-09-24T04:40:00Z"}
+
+    async def ctx(user: str, tok: str) -> tuple[str, str]:
+        return "", ""
+
+    async def completion(system, user_prompt, **kw) -> ModelCompletion:
+        return ModelCompletion(json.dumps({"standfirst": "One sentence.", "environments": {}, "blockers": [], "cleared": [], "watch": []}),
+            model_route="sovereign", model_name="glm-5.3-flash")
+
+    async def prev(before_key: str):
+        return None
+
+    async def snap_store(key: str, payload: list) -> None:
+        return None
+
+    async def prune(*a, **k):
+        return 0
+
+    upsert_order: list[str] = []
+
+    async def upsert(slug, kind, title, html, **kw):
+        upsert_order.append(slug)
+
+    async def notify(*a, **k):
+        return None
+
+    monkeypatch.setattr(sp, "get_github_token", token)
+    monkeypatch.setattr(sp, "fetch_latest_status_snapshot", snap)
+    monkeypatch.setattr(sp, "gather_context", ctx)
+    monkeypatch.setattr(sp, "call_claude", completion)
+    monkeypatch.setattr(sp, "upsert_published_page", upsert)
+    monkeypatch.setattr(sp, "post_message", notify)
+    monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
+    monkeypatch.setattr(sp, "previous_status_snapshot", prev)
+    monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
+    monkeypatch.setattr(sp, "prune_published_pages", prune)
+
+    await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
+
+    assert upsert_order == ["env-status-2026-09-24", "env-status"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_latest_snapshot_http_error_mentions_run_and_not_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failing artifact download surfaces the run id and HTTP code, never GitHub's
+    short-lived signed download URL (which is the reason raise_for_status is avoided)."""
+
+    class FakeResponse:
+        def __init__(self, json_body=None, status_code=200):
+            self._json = json_body
+            self.status_code = status_code
+            self.content = b""
+
+        def json(self):
+            return self._json
+
+        def raise_for_status(self):
+            pass
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            self.responses = [
+                FakeResponse({"workflow_runs": [
+                    {"id": 123456, "html_url": "https://github.com/x", "created_at": "2026-09-24T04:40:00Z",
+                     "artifacts_url": "https://api.github.com/artifacts"}]}),
+                FakeResponse({"artifacts": [
+                    {"name": "environment-status-page", "archive_download_url": "https://signed.example/secret.zip"}]}),
+                FakeResponse(status_code=500),
+            ]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **k):
+            return self.responses.pop(0)
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    with pytest.raises(RuntimeError) as ei:
+        await sp.fetch_latest_status_snapshot("tok")
+
+    msg = str(ei.value)
+    assert "123456" in msg
+    assert "HTTP 500" in msg
+    assert "signed.example" not in msg
