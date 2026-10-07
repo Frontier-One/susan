@@ -17,6 +17,10 @@ from app.slack_commands import (
     split_repo_prefix_from_approve_value,
 )
 
+# Contract with app.retro.start_retro: a successful dispatch returns a string
+# beginning with this prefix, which retro.py matches to record the retro.
+RETRO_DISPATCH_SUCCESS_PREFIX = "Retro started"
+
 async def create_github_issue(content: str, slack_user_id: str) -> str:
     try:
         token = await get_github_token(slack_user_id)
@@ -137,7 +141,7 @@ async def dispatch_incident_retro(
     Returns a short human string on success and on error (does not raise).
     """
     repo = (os.environ.get("SUSAN_RETRO_DISPATCH_REPO") or "Frontier-One/dev-tools").strip()
-    ref = os.environ.get("GITHUB_BASE_BRANCH", "main").strip() or "main"
+    ref = (os.environ.get("SUSAN_RETRO_DISPATCH_REF") or "main").strip()
     token = (os.environ.get("GITHUB_TOKEN") or "").strip()
     if not token:
         if not slack_user_id:
@@ -165,6 +169,6 @@ async def dispatch_incident_retro(
             )
     except Exception as e:
         return f"Retro dispatch failed: {e}"
-    if r.status_code >= 400:
+    if not 200 <= r.status_code < 300:
         return f"Retro dispatch error ({r.status_code}): {r.text}"
-    return f"Retro started: {permalink}"
+    return f"{RETRO_DISPATCH_SUCCESS_PREFIX}: {permalink}"

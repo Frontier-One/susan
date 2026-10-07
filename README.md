@@ -155,6 +155,7 @@ the proposed field values go into the issue body for a human to set.
 | `GITHUB_CLIENT_SECRET` | For GitHub features | |
 | `GITHUB_REDIRECT_URI` | For GitHub features | e.g. `https://<host>/auth/github/callback` |
 | `PUBLIC_BASE_URL` | Strongly recommended | e.g. `https://<host>` — used for “Connect” links in Slack |
+| `SUSAN_WORKSPACE_URL` | Optional | Base URL of the Slack workspace Susan links to (default `https://frontier-one.slack.com`); set it in any non-Frontier-One deployment so permalink links point at the right workspace |
 | `DATABASE_URL` | Recommended in prod | Postgres URL on Railway, etc. |
 | `SQLITE_PATH` | Optional | SQLite file path if not using Postgres (use a **persistent** path on PaaS) |
 | `OAUTH_STATE_SECRET` | Optional | Separate HMAC key for OAuth `state` (default: `SLACK_SIGNING_SECRET`) |

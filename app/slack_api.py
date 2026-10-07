@@ -266,7 +266,9 @@ async def _try_slack_join_channel(channel: str) -> None:
         logger.warning("Slack: conversations.join failed: %s", data)
 
 
-async def _fetch_slack_history_once(channel: str, thread_ts: str | None) -> dict:
+async def _fetch_slack_history_page(
+    channel: str, thread_ts: str | None, cursor: str | None
+) -> dict:
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
     params = {"channel": channel, "limit": 50}
     endpoint = (
@@ -276,20 +278,46 @@ async def _fetch_slack_history_once(channel: str, thread_ts: str | None) -> dict
     )
     if thread_ts:
         params["ts"] = thread_ts
+    if cursor:
+        params["cursor"] = cursor
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(endpoint, headers=headers, params=params)
     return r.json()
 
 
+async def _fetch_slack_history_all(channel: str, thread_ts: str | None) -> dict:
+    """Fetch every message in a channel or thread, following next_cursor.
+
+    conversations.replies / conversations.history page at 50 messages. Without
+    following the cursor, a busy incident thread is silently cut to its first
+    50, which drops the tail of the discussion the retro workflow reads.
+    """
+    collected: list[dict] = []
+    cursor: str | None = None
+    while True:
+        data = await _fetch_slack_history_page(channel, thread_ts, cursor)
+        if not data.get("ok"):
+            return {
+                "ok": False,
+                "error": data.get("error", "unknown_error"),
+                "messages": collected,
+            }
+        batch = data.get("messages") or []
+        collected.extend(batch)
+        cursor = (data.get("response_metadata") or {}).get("next_cursor") or None
+        if not cursor:
+            return {"ok": True, "messages": collected}
+
+
 async def fetch_slack_history(
     channel: str, thread_ts: str | None, slack_user_id: str | None = None
 ) -> str:
-    data = await _fetch_slack_history_once(channel, thread_ts)
+    data = await _fetch_slack_history_all(channel, thread_ts)
     if not data.get("ok"):
         err = data.get("error", "unknown_error")
         if err in ("channel_not_found", "not_in_channel") and _is_public_slack_channel(channel):
             await _try_slack_join_channel(channel)
-            data = await _fetch_slack_history_once(channel, thread_ts)
+            data = await _fetch_slack_history_all(channel, thread_ts)
         elif (
             err in ("channel_not_found", "not_in_channel")
             and _is_dm_slack_channel(channel)
@@ -297,13 +325,13 @@ async def fetch_slack_history(
         ):
             new_ch = await _try_slack_open_im_with_user(slack_user_id)
             if new_ch:
-                data = await _fetch_slack_history_once(new_ch, thread_ts)
+                data = await _fetch_slack_history_all(new_ch, thread_ts)
         elif err in ("channel_not_found", "not_in_channel") and _is_private_or_mpim_slack_channel(
             channel
         ):
             new_ch = await _try_slack_open_by_channel_id(channel)
             if new_ch:
-                data = await _fetch_slack_history_once(new_ch, thread_ts)
+                data = await _fetch_slack_history_all(new_ch, thread_ts)
     if not data.get("ok"):
         err = data.get("error", "unknown_error")
         logger.error("Slack conversations API failed: %s full=%s", err, data)

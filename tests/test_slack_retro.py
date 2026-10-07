@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 import db
 
+from app.github_actions import RETRO_DISPATCH_SUCCESS_PREFIX
 from app.retro import dispatch_incident_retro
 from app.slack_events import handle_slack_event_callback
 from app.retro import process_retro_command, start_retro
@@ -53,18 +54,21 @@ def _stub_event_leaves(monkeypatch: pytest.MonkeyPatch) -> dict:
     event_get = mock.AsyncMock(return_value=None)
     retro_get = mock.AsyncMock(return_value=None)
     post = mock.AsyncMock()
-    dispatch = mock.AsyncMock(return_value=f"Retro started: {PERMALINK}")
+    dispatch = mock.AsyncMock(return_value=f"{RETRO_DISPATCH_SUCCESS_PREFIX}: {PERMALINK}")
     create = mock.AsyncMock(return_value="rid-1")
+    digest_get = mock.AsyncMock(return_value=None)
 
     monkeypatch.setattr("app.slack_events.fetch_slack_history", fetch)
     monkeypatch.setattr("app.slack_events.get_incident_retro", event_get)
+    monkeypatch.setattr("app.slack_events.get_digest_for_thread", digest_get)
     monkeypatch.setattr("app.retro.get_incident_retro", retro_get)
     monkeypatch.setattr("app.retro.post_message", post)
     monkeypatch.setattr("app.slack_events.post_message", post)
     monkeypatch.setattr("app.retro.dispatch_incident_retro", dispatch)
     monkeypatch.setattr("app.retro.create_incident_retro", create)
     return {"fetch": fetch, "event_get": event_get, "retro_get": retro_get,
-            "post": post, "dispatch": dispatch, "create": create}
+            "post": post, "dispatch": dispatch, "create": create,
+            "digest_get": digest_get}
 
 
 @pytest.mark.asyncio
@@ -130,8 +134,8 @@ async def test_retro_already_started_message(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.asyncio
-async def test_failed_dispatch_does_not_record_retro(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failed workflow dispatch does not record the retro and surfaces the error."""
+async def test_failed_dispatch_does_not_record_or_post(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed dispatch posts no kickoff and records no retro, leaving the thread retryable."""
     retro_get = mock.AsyncMock(return_value=None)
     post = mock.AsyncMock()
     dispatch = mock.AsyncMock(return_value="Retro dispatch error (422): nope")
@@ -147,8 +151,36 @@ async def test_failed_dispatch_does_not_record_retro(monkeypatch: pytest.MonkeyP
 
     assert result == "Retro dispatch error (422): nope"
     dispatch.assert_awaited_once()
-    post.assert_awaited_once()
+    post.assert_not_awaited()
     create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_successful_dispatch_posts_kickoff_after_recording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful dispatch records the retro first, then posts a single kickoff."""
+    retro_get = mock.AsyncMock(return_value=None)
+    post = mock.AsyncMock()
+    dispatch = mock.AsyncMock(return_value=f"{RETRO_DISPATCH_SUCCESS_PREFIX}: {PERMALINK}")
+    create = mock.AsyncMock(return_value="rid-3")
+    monkeypatch.setattr("app.retro.get_incident_retro", retro_get)
+    monkeypatch.setattr("app.retro.post_message", post)
+    monkeypatch.setattr("app.retro.dispatch_incident_retro", dispatch)
+    monkeypatch.setattr("app.retro.create_incident_retro", create)
+
+    result = await start_retro(
+        channel=CHANNEL, thread_root_ts=THREAD_TS, permalink=PERMALINK, thread_text="x"
+    )
+
+    assert result == f"{RETRO_DISPATCH_SUCCESS_PREFIX}: {PERMALINK}"
+    dispatch.assert_awaited_once()
+    create.assert_awaited_once_with(CHANNEL, THREAD_TS, PERMALINK)
+    post.assert_awaited_once()
+    call = post.await_args
+    assert call.args[0] == CHANNEL
+    assert call.kwargs.get("thread_ts") == THREAD_TS
+    assert "Outage postmortem" in call.args[1]
 
 
 @pytest.mark.asyncio
@@ -205,6 +237,8 @@ class FakeClient:
 async def test_dispatch_incident_retro_url_and_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
     client = FakeClient(FakeResponse(204, {}))
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    monkeypatch.delenv("GITHUB_BASE_BRANCH", raising=False)
+    monkeypatch.delenv("SUSAN_RETRO_DISPATCH_REPO", raising=False)
     monkeypatch.setattr("app.github_actions.httpx.AsyncClient", lambda **kw: client)
 
     result = await dispatch_incident_retro(
@@ -215,7 +249,7 @@ async def test_dispatch_incident_retro_url_and_inputs(monkeypatch: pytest.Monkey
         slack_user_id="U1",
     )
 
-    assert result == f"Retro started: {PERMALINK}"
+    assert result == f"{RETRO_DISPATCH_SUCCESS_PREFIX}: {PERMALINK}"
     assert len(client.calls) == 1
     url, headers, payload = client.calls[0]
     assert url == "https://api.github.com/repos/Frontier-One/dev-tools/actions/workflows/incident-retro.yml/dispatches"
@@ -236,7 +270,8 @@ async def test_dispatch_incident_retro_custom_repo_and_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SUSAN_RETRO_DISPATCH_REPO", "MyOrg/MyRepo")
-    monkeypatch.setenv("GITHUB_BASE_BRANCH", "release")
+    monkeypatch.setenv("SUSAN_RETRO_DISPATCH_REF", "release")
+    monkeypatch.delenv("GITHUB_BASE_BRANCH", raising=False)
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     client = FakeClient(FakeResponse(204, {}))
     monkeypatch.setattr("app.github_actions.httpx.AsyncClient", lambda **kw: client)
@@ -332,7 +367,7 @@ async def test_process_retro_command_drives_orchestrator(
     notify = mock.AsyncMock()
     retro_get = mock.AsyncMock(return_value=None)
     post = mock.AsyncMock()
-    dispatch = mock.AsyncMock(return_value=f"Retro started: {PERMALINK}")
+    dispatch = mock.AsyncMock(return_value=f"{RETRO_DISPATCH_SUCCESS_PREFIX}: {PERMALINK}")
     create = mock.AsyncMock(return_value="rid-2")
     resolve_root = mock.AsyncMock(return_value=ROOT_TS)
 
@@ -357,7 +392,7 @@ async def test_process_retro_command_drives_orchestrator(
     assert call.kwargs["thread_ts"] == ROOT_TS
     assert call.kwargs["permalink"] == PERMALINK
     notify.assert_awaited_once()
-    assert notify.await_args.args[2] == f"Retro started: {PERMALINK}"
+    assert notify.await_args.args[2] == f"{RETRO_DISPATCH_SUCCESS_PREFIX}: {PERMALINK}"
 
 
 @pytest.mark.asyncio
@@ -425,4 +460,25 @@ async def test_incident_retro_db_round_trip() -> None:
 
     found = await db.get_incident_retro(channel_id, thread_root_ts)
     assert found is not None
+    assert found["permalink"] == permalink
+
+
+@pytest.mark.asyncio
+async def test_incident_retro_create_duplicate_returns_same_id() -> None:
+    await db.init_db()
+    channel_id = "C-retro-dup"
+    thread_root_ts = THREAD_TS
+    permalink = PERMALINK
+
+    first_id = await db.create_incident_retro(channel_id, thread_root_ts, permalink)
+    assert first_id
+
+    # A second create for the same thread must not insert a duplicate row; it
+    # returns the existing row's id so the DB write itself is idempotent.
+    second_id = await db.create_incident_retro(channel_id, thread_root_ts, permalink)
+    assert second_id == first_id
+
+    found = await db.get_incident_retro(channel_id, thread_root_ts)
+    assert found is not None
+    assert found["id"] == first_id
     assert found["permalink"] == permalink

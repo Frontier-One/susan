@@ -533,32 +533,6 @@ async def resume_slash_after_oauth(row: dict) -> None:
             except Exception as e2:
                 logger.error("resume_slash_after_oauth notify: %s", e2)
         return
-    if action == "retro":
-        from app.retro import process_retro_command
-
-        try:
-            await post_ephemeral(
-                channel,
-                user,
-                "Resuming your *incident postmortem* after sign-in…",
-            )
-        except Exception as e:
-            logger.warning("resume_slash_after_oauth intro ephemeral: %s", e)
-        try:
-            await process_retro_command(text, channel, user, response_url)
-        except Exception as e:
-            logger.exception("resume_slash_after_oauth retro failed")
-            try:
-                await notify_user_ephemeral(
-                    channel,
-                    user,
-                    f"Could not resume the postmortem after sign-in: {e}",
-                    None,
-                    response_url,
-                )
-            except Exception as e2:
-                logger.error("resume_slash_after_oauth notify: %s", e2)
-        return
     try:
         await post_ephemeral(
             channel,

@@ -20,7 +20,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
-from sqlalchemy import Boolean, String, Text, DateTime, Integer
+from sqlalchemy import Boolean, String, Text, DateTime, Integer, UniqueConstraint
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -287,6 +288,7 @@ class IncidentRetro(Base):
     """A started incident postmortem; at most one per outage thread (idempotency)."""
 
     __tablename__ = "incident_retros"
+    __table_args__ = (UniqueConstraint("channel_id", "thread_root_ts", name="uq_incident_retros_thread"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     channel_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
@@ -531,7 +533,25 @@ async def create_incident_retro(channel_id: str, thread_root_ts: str, permalink:
                 created_at=now,
             )
         )
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError:
+            # Another writer already started a retro for this thread; reuse it.
+            await session.rollback()
+            from sqlalchemy import select
+            q = (
+                select(IncidentRetro.id)
+                .where(
+                    IncidentRetro.channel_id == channel_id,
+                    IncidentRetro.thread_root_ts == thread_root_ts,
+                )
+                .order_by(IncidentRetro.created_at.desc())
+                .limit(1)
+            )
+            existing_id = (await session.execute(q)).scalar_one_or_none()
+            if existing_id:
+                return existing_id
+            return rid
     return rid
 
 

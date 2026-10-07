@@ -1,12 +1,14 @@
 """Slack Events API: thread replies on action-item digests update tracked status."""
 from __future__ import annotations
 
+import asyncio
 import json
 
 from db import get_digest_for_thread, get_incident_retro, list_active_action_items
 
 from app.action_items import apply_status_reply_with_claude, format_status_ack
 from app.config import logger
+from app.github_actions import RETRO_DISPATCH_SUCCESS_PREFIX
 from app.retro import start_retro
 from app.slack_api import (
     build_slack_message_permalink,
@@ -20,12 +22,25 @@ def _carries_resolved_marker(text: str) -> bool:
     return ":large_green_circle:" in text and "*Resolved*" in text
 
 
+_THREAD_HISTORY_RETRIES = 3
+_THREAD_HISTORY_RETRY_DELAY = 1.0
+
+
 async def _fetch_thread_history(channel: str, thread_ts: str, user: str) -> str | None:
-    """Return the thread history, or None when it cannot be read."""
-    try:
-        return await fetch_slack_history(channel, thread_ts, user)
-    except Exception:
-        return None
+    """Return the thread history, or None when it cannot be read.
+
+    A transient read failure is retried before giving up: the Slack event is
+    acknowledged before this background task runs, so a dropped fetch would
+    lose the resolved-marker retro trigger permanently.
+    """
+    for attempt in range(_THREAD_HISTORY_RETRIES):
+        try:
+            return await fetch_slack_history(channel, thread_ts, user)
+        except Exception:
+            if attempt == _THREAD_HISTORY_RETRIES - 1:
+                return None
+            await asyncio.sleep(_THREAD_HISTORY_RETRY_DELAY)
+    return None
 
 
 def _history_carries_outage_marker(history: str) -> bool:
@@ -58,7 +73,7 @@ async def _maybe_start_retro(channel: str, user: str, text: str, thread_ts: str)
         thread_text=history,
         slack_user_id=user,
     )
-    if not result.startswith("Retro started"):
+    if not result.startswith(RETRO_DISPATCH_SUCCESS_PREFIX):
         logger.warning("Retro dispatch failed for %s: %s", permalink, result)
 
 
@@ -79,7 +94,10 @@ async def handle_slack_event_callback(payload: dict) -> None:
 
     # The retro path is independent of the action-item digest, so it runs before
     # the digest gate below (which returns early when there is no digest).
-    await _maybe_start_retro(channel, user, text, thread_ts)
+    try:
+        await _maybe_start_retro(channel, user, text, thread_ts)
+    except Exception:
+        logger.exception("Incident retro trigger failed")
 
     digest = await get_digest_for_thread(channel, thread_ts)
     if not digest:

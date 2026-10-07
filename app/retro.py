@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from db import create_incident_retro, get_incident_retro
 
-from app.github_actions import dispatch_incident_retro
+from app.github_actions import (
+    RETRO_DISPATCH_SUCCESS_PREFIX,
+    dispatch_incident_retro,
+)
 from app.slack_api import (
     extract_slack_archives_link,
     fetch_slack_history,
@@ -58,7 +61,6 @@ async def start_retro(
         return f"Retro already started: {existing['permalink']}"
 
     kickoff = _build_retro_kickoff(thread_text)
-    await post_message(channel, kickoff, thread_ts=thread_root_ts)
 
     result = await dispatch_incident_retro(
         channel=channel,
@@ -67,10 +69,13 @@ async def start_retro(
         text=thread_text,
         slack_user_id=slack_user_id,
     )
-    # Only record the retro when the workflow dispatch succeeded, so a failed
-    # dispatch leaves the thread retryable instead of answering "started".
-    if result.startswith("Retro started"):
+    # Only record the retro and post the kickoff when the workflow dispatch
+    # succeeded, so a failed dispatch leaves the thread retryable and retrying
+    # does not duplicate the kickoff. The retro is recorded before the kickoff
+    # is posted, so a later trigger reports the existing one instead.
+    if result.startswith(RETRO_DISPATCH_SUCCESS_PREFIX):
         await create_incident_retro(channel, thread_root_ts, permalink)
+        await post_message(channel, kickoff, thread_ts=thread_root_ts)
     return result
 
 
@@ -82,16 +87,6 @@ async def process_retro_command(
 ) -> None:
     """Run a ``/susan retro <permalink>``: parse, fetch the thread, start the retro, notify."""
     link_ch, link_ts = extract_slack_archives_link(permalink)
-    if not link_ch or not link_ts:
-        await notify_user_ephemeral(
-            channel,
-            user,
-            "I couldn't parse a valid Slack thread link from that. "
-            "Paste a message permalink (⋯ → Copy link), e.g. `/susan retro https://…/archives/C…/p…`.",
-            None,
-            response_url,
-        )
-        return
     thread_text = await fetch_slack_history(link_ch, link_ts, user)
     # Resolve the pasted message (which may be a reply) to its thread root so
     # the idempotency key and post target are the same key the automatic path
