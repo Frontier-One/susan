@@ -139,6 +139,13 @@ def extract_slack_archives_link(text: str) -> tuple[str | None, str | None]:
     return channel_id, ts
 
 
+def build_slack_message_permalink(channel: str, ts: str) -> str:
+    """Build a Slack message permalink from a channel id and message timestamp."""
+    digits = (ts or "").replace(".", "")
+    base = (os.environ.get("SUSAN_WORKSPACE_URL") or "https://frontier-one.slack.com").rstrip("/")
+    return f"{base}/archives/{channel}/p{digits}"
+
+
 def _is_public_slack_channel(channel_id: str) -> bool:
     """conversations.join is only valid for public channels (ids start with C)."""
     return bool(channel_id) and channel_id.upper().startswith("C")

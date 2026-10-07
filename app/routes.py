@@ -69,7 +69,11 @@ from app.roadmap import (
     process_roadmap,
     process_roadmap_add,
 )
-from app.slack_commands import process_command, resume_slash_after_oauth
+from app.slack_commands import (
+    parse_retro_command,
+    process_command,
+    resume_slash_after_oauth,
+)
 from app.slack_api import (
     _slack_form_fields,
     detect_action,
@@ -103,6 +107,7 @@ from app.standup_digest import parse_daily_standup_command, process_standup_dige
 from app.status_page import parse_status_page_command, process_status_page, status_page_token
 
 from app.sales_prep import parse_sales_prep_command, process_sales_prep
+from app.retro import process_retro_command
 from app.slack_events import handle_slack_event_callback, parse_events_body
 from app.scheduler import handle_schedule_slash, parse_schedule_command, start_scheduler, stop_scheduler
 from app.weekly_status import process_weekly_status
@@ -1315,6 +1320,32 @@ async def slash_susan(request: Request, background_tasks: BackgroundTasks):
                 "text": (
                     "Got it — Susan is checking both farms. You’ll get the status here "
                     "in a moment."
+                ),
+            }
+        )
+
+    retro_permalink = parse_retro_command(text)
+    if retro_permalink is not None:
+
+        async def run_retro():
+            try:
+                await process_retro_command(retro_permalink, channel, user, response_url)
+            except Exception as e:
+                logger.exception("retro task failed")
+                try:
+                    await notify_user_ephemeral(
+                        channel, user, f"Susan error (retro): {str(e)}", None, response_url
+                    )
+                except Exception as e2:
+                    logger.error("Could not notify user after retro error: %s", e2)
+
+        background_tasks.add_task(run_retro)
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": (
+                    "Got it — Susan is starting the *postmortem* for that thread. "
+                    "You’ll get confirmation here in a moment."
                 ),
             }
         )

@@ -121,3 +121,50 @@ async def create_github_pr(content: str, slack_user_id: str) -> str:
     if pr_status >= 400:
         return f"PR not created ({pr_status}): {pr_data}"
     return f"PR created: {pr_data.get('html_url', pr_data)}"
+
+
+async def dispatch_incident_retro(
+    *,
+    channel: str,
+    thread_ts: str,
+    permalink: str,
+    text: str,
+    slack_user_id: str | None = None,
+) -> str:
+    """Dispatch dev-tools' incident-retro workflow for an outage thread.
+
+    Prefers the shared ``GITHUB_TOKEN``; falls back to the user's OAuth token.
+    Returns a short human string on success and on error (does not raise).
+    """
+    repo = (os.environ.get("SUSAN_RETRO_DISPATCH_REPO") or "Frontier-One/dev-tools").strip()
+    ref = os.environ.get("GITHUB_BASE_BRANCH", "main").strip() or "main"
+    token = (os.environ.get("GITHUB_TOKEN") or "").strip()
+    if not token:
+        if not slack_user_id:
+            return "Retro dispatch failed: no GitHub token available."
+        try:
+            token = await get_github_token(slack_user_id)
+        except ValueError as e:
+            return str(e)
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    payload = {
+        "ref": ref,
+        "inputs": {
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "permalink": permalink,
+            "text": text,
+        },
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"https://api.github.com/repos/{repo}/actions/workflows/incident-retro.yml/dispatches",
+                headers=hdrs,
+                json=payload,
+            )
+    except Exception as e:
+        return f"Retro dispatch failed: {e}"
+    if r.status_code >= 400:
+        return f"Retro dispatch error ({r.status_code}): {r.text}"
+    return f"Retro started: {permalink}"

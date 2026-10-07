@@ -105,6 +105,21 @@ SLACK_CB_EMAIL_MODAL = "susan_submit_email"
 SLACK_CB_INVITE_MODAL = "susan_submit_invite"
 
 
+def parse_retro_command(text: str) -> str | None:
+    """Return the command text for ``/susan retro <link>`` when it carries a valid Slack thread link.
+
+    Returns None (so handling falls through to the unknown-command path) when the
+    text does not start with ``retro`` or has no parsable archives link.
+    """
+    t = (text or "").strip()
+    if not re.match(r"retro\b", t, re.IGNORECASE):
+        return None
+    link_ch, link_ts = extract_slack_archives_link(t)
+    if not link_ch or not link_ts:
+        return None
+    return t
+
+
 def _looks_like_draft_id(value: str) -> bool:
     v = (value or "").strip()
     if len(v) != 36:
@@ -514,6 +529,32 @@ async def resume_slash_after_oauth(row: dict) -> None:
                     None,
                     response_url,
                     skip_sovereign_attribution=True,
+                )
+            except Exception as e2:
+                logger.error("resume_slash_after_oauth notify: %s", e2)
+        return
+    if action == "retro":
+        from app.retro import process_retro_command
+
+        try:
+            await post_ephemeral(
+                channel,
+                user,
+                "Resuming your *incident postmortem* after sign-in…",
+            )
+        except Exception as e:
+            logger.warning("resume_slash_after_oauth intro ephemeral: %s", e)
+        try:
+            await process_retro_command(text, channel, user, response_url)
+        except Exception as e:
+            logger.exception("resume_slash_after_oauth retro failed")
+            try:
+                await notify_user_ephemeral(
+                    channel,
+                    user,
+                    f"Could not resume the postmortem after sign-in: {e}",
+                    None,
+                    response_url,
                 )
             except Exception as e2:
                 logger.error("resume_slash_after_oauth notify: %s", e2)
