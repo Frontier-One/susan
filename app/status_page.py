@@ -17,7 +17,10 @@ never touching a model:
   4. HOSTING: the HTML is stored in Susan's DB and served at GET /status/{slug} behind
      SUSAN_STATUS_PAGE_TOKEN (the page carries codewords and private addresses, so it is
      not public — cloud-infra #635's reason for refusing GitHub Pages). The Slack post
-     carries the tokened link.
+     carries the tokened link. The stable slug `env-status` is that published,
+     overwritten-in-place URL: `/status/env-status` always resolves to the newest published
+     env-status page, `/status/latest` does the same, and dated `env-status-YYYY-MM-DD`
+     slugs are archival.
 
 Skills (slash phrasing):
   /susan status page [--no-approval]
@@ -44,6 +47,7 @@ from app.slack_api import fetch_slack_channel_history_since, notify_user_ephemer
 from app.weekly_context import strip_weekly_status_auto_post_flags
 from db import (
     get_github_token,
+    get_published_page,
     previous_status_snapshot,
     prune_published_pages,
     upsert_published_page,
@@ -54,6 +58,10 @@ STATUS_REPO = "Frontier-One/cloud-infra"
 STATUS_WORKFLOW_FILE = "env-nightly.yml"
 STATUS_ARTIFACT_NAME = "environment-status-page"
 PAGE_KIND = "env-status"
+# A snapshot is stale if its probe ran more than this many hours before the page was
+# built. 26h is more than one nightly interval, so a page built after last night's run
+# but fed an older snapshot is flagged rather than silently passed off as fresh.
+STALE_AFTER_HOURS = 26
 
 # "status" ALONE stays the weekly status (an older, separate command) — these are the
 # phrasings that unambiguously mean this page. Longest first so a longer phrase is not
@@ -144,6 +152,10 @@ async def fetch_latest_status_snapshot(token: str) -> dict[str, Any]:
         snap = extract_snapshot(r.content)
     snap["run_url"] = run.get("html_url", "")
     snap["run_created_at"] = run.get("created_at", "")
+    snap["run_id"] = run.get("id")
+    # GitHub reflects a run's completion time in updated_at, so that is what the page
+    # shows as "Run completed" — never the time the page happened to be rendered.
+    snap["run_completed_at"] = run.get("updated_at", "")
     return snap
 
 
@@ -232,6 +244,86 @@ def _snapshot_date_key(when: str) -> str:
         if parsed is not None and parsed.date().isoformat() == y:
             return y
     return datetime.now(timezone.utc).date().isoformat()
+
+
+def _parse_generated(when: str) -> datetime | None:
+    """A probe's generated timestamp as UTC; None when unparseable or absent.
+
+    Accepts the ISO timestamps status.json carries and the bare YYYY-MM-DD form the
+    snapshot date key already tolerates. A naive value is read as UTC. None here never
+    raises: an unreadable generated stamp just means no freshness claim either way.
+    """
+    if not isinstance(when, str) or not when.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(when.strip().replace("Z", "+00:00"))
+    except ValueError:
+        m = re.match(r"(\d{4}-\d{2}-\d{2})", when.strip())
+        if not m:
+            return None
+        try:
+            dt = datetime.strptime(m.group(1), "%Y-%m-%d")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """A timestamp's UTC moment; a naive stamp is read as UTC."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def refuses_stale_publish(fetched_generated: datetime | None, published_generated: datetime | None) -> bool:
+    """True when the fetched snapshot is strictly older than the live page's source.
+
+    Only refuses when both timestamps are known: a missing either side is no evidence,
+    so the first publish and any unparseable stamp are allowed. Both stamps are
+    normalized to UTC-aware first, since the published stamp is read back naive from a
+    SQLite-held DB while the fetched stamp is UTC-aware.
+    """
+    if fetched_generated is None or published_generated is None:
+        return False
+    return _as_utc(fetched_generated) < _as_utc(published_generated)
+
+
+def _stale_notice(snapshot_when: str, generated_at: datetime) -> str:
+    """A banner when the snapshot predates last night's probe; empty when fresh/unknown."""
+    feed = _parse_generated(snapshot_when)
+    if feed is None:
+        return ""
+    hours_old = (_as_utc(generated_at) - feed).total_seconds() / 3600.0
+    if hours_old <= STALE_AFTER_HOURS:
+        return ""
+    nights = max(1, round(hours_old / 24.0))
+    return (
+        f'<div class="note"><b>Data is {nights} nights old.</b> The probe that produced '
+        "this snapshot ran before last night's, so these figures are older than the latest "
+        "nightly run and should not be read as fresh.</div>"
+    )
+
+
+_NOTE_RE = re.compile(r'<div class="note">.*?</div>', re.DOTALL)
+
+
+def _with_stale_notice(page_html: str, notice: str) -> str:
+    """A page carrying exactly one stale notice, without re-rendering the facts it holds.
+
+    Used when a run refuses to publish a staler snapshot: the live page keeps its fresher
+    content but gains the current notice, so a reader is not left to compare timestamps.
+    The notice text grows nightly, so an existing block is stripped before the new one is
+    inserted rather than deduped by exact text — the live page carries exactly one banner.
+    """
+    if not notice:
+        return page_html
+    page_html = _NOTE_RE.sub("", page_html)
+    after = "<body>"
+    if after in page_html:
+        return page_html.replace(after, after + notice, 1)
+    return notice + page_html
 
 
 # ── 3. narrative from our model, as strict JSON ────────────────────────────────────────
@@ -534,6 +626,7 @@ def render_status_page(
     rows: list[dict[str, Any]], narrative: dict[str, Any] | None, *,
     snapshot_when: str, run_url: str, generated_at: datetime, model_name: str | None,
     cleared: list[str] | None = None,
+    run_id: str | None = None, run_completed_at: str | None = None,
 ) -> str:
     n = narrative or {}
     readings = n.get("environments") or {}
@@ -555,6 +648,7 @@ def render_status_page(
         '<div class="note"><b>Narrative unavailable this run.</b> The model did not return a readable '
         'narrative, so this page carries the measured facts only. Nothing below is inferred.</div>'
     )
+    stale_note = _stale_notice(snapshot_when, generated_at)
     standfirst = _esc(n.get("standfirst") or "Every environment we run and whether it was healthy at last night's probe. "
                       "Environments are named by codeword; the customer behind each codeword is deliberately not on this page.")
     who = f"narrative by <b>{_esc(model_name)}</b> (sovereign route)" if model_name else "narrative unavailable"
@@ -567,8 +661,9 @@ def render_status_page(
 <style>{_CSS}</style></head><body><div class="wrap">
 <header class="masthead"><p class="eyebrow">Frontier One · Internal · generated by Susan</p><h1>Environment status</h1>
 <p class="standfirst">{standfirst}</p>
-<div class="stamp"><span><b>Snapshot</b> {_esc(snapshot_when or "unknown")}</span><span><b>Environments</b> {len(rows)} ({len(measured)} measured)</span>
+<div class="stamp"><span><b>Run</b> {_esc(run_id or "unknown")}</span><span><b>Run completed</b> {_esc(run_completed_at or "unknown")}</span><span><b>Snapshot</b> {_esc(snapshot_when or "unknown")}</span><span><b>Environments</b> {len(rows)} ({len(measured)} measured)</span>
 <span><b>Apps clean</b> {clean_apps} of {total_apps}</span><span><b>Clusters reachable</b> {up} of {clusters}</span><span><b>Page built</b> {generated_at.strftime("%Y-%m-%d %H:%M UTC")}</span></div></header>
+{stale_note}
 {narrative_note}
 <section><h2>The environments</h2><p class="sub">App tallies and cluster reachability are last night's probe, rendered by code. An environment the probe could not read is shown as not measured, never as healthy.</p>
 <div class="cards">{cards}</div></section>
@@ -617,7 +712,7 @@ def slack_summary(rows: list[dict[str, Any]], narrative: dict[str, Any] | None, 
 
 async def process_status_page(
     command_text: str, channel: str, user: str, thread_ts: str | None, response_url: str | None,
-    *, auto_publish: bool = False,
+    *, auto_publish: bool = False, now: datetime | None = None,
 ) -> None:
     _remainder, auto_flag = strip_weekly_status_auto_post_flags(parse_status_page_command(command_text) or "")
     auto_publish = auto_publish or auto_flag
@@ -648,6 +743,7 @@ async def process_status_page(
     narrative = None
     model_name = None
     model_route = None
+    stable_committed = False
     try:
         previous = await previous_status_snapshot(date_key)
         cleared = cleared_facts(rows, previous)
@@ -667,25 +763,85 @@ async def process_status_page(
         except Exception as e:
             logger.exception("status page: narrative failed: %s", e)
 
-        now = datetime.now(timezone.utc)
+        now = now if now is not None else datetime.now(timezone.utc)
         page = render_status_page(rows, narrative, snapshot_when=str(when), run_url=snap.get("run_url") or "",
-                                  generated_at=now, model_name=model_name if narrative else None, cleared=cleared)
+                                  generated_at=now, model_name=model_name if narrative else None, cleared=cleared,
+                                  run_id=snap.get("run_id") or None,
+                                  run_completed_at=snap.get("run_completed_at") or None)
+        # AC2: never replace a fresher published page with a staler snapshot. If the
+        # snapshot this run fetched predates the live page's own generated stamp, refuse
+        # to publish the staler snapshot or its facts, and tell the user why.
+        # Fall back to the run's own timestamp when status.json carries no generated
+        # stamp: run_created_at is a conservative lower bound on the snapshot's freshness
+        # claim, so a staler run with unmeasured data still cannot replace a fresher page.
+        fetched_generated = _parse_generated((snap.get("status_json") or {}).get("generated") or snap.get("run_created_at") or "")
+        live = await get_published_page(STABLE_SLUG)
+        if refuses_stale_publish(fetched_generated, live.get("generated_at") if live else None):
+            live_when = (_as_utc(live["generated_at"]).isoformat() if (live and live.get("generated_at")) else "unknown")
+            await notify_user_ephemeral(
+                channel, user,
+                f"This run's snapshot is older than the status page already published (fetched "
+                f"{fetched_generated.isoformat() if fetched_generated else 'unknown'}, page built from {live_when}), "
+                "so nothing was replaced. Time only moves forward on this page; run the nightly again when a "
+                "fresher snapshot exists.",
+                None, response_url)
+            # AC3: the still-live page must still tell a reader how stale its data is. Its
+            # own stale banner was computed at its original (fresh) render time, so persist
+            # a current notice on it. The build-time proxy is the live page's own
+            # generated_at, the time its snapshot's probe ran. The staler fetched snapshot's
+            # facts stay unpublished.
+            stale_notice = (
+                _stale_notice(live["generated_at"].isoformat(), now)
+                if (live and live.get("generated_at")) else ""
+            )
+            await upsert_published_page(
+                STABLE_SLUG, PAGE_KIND, live.get("title") or "Frontier One — Environment Status",
+                _with_stale_notice(live["html"], stale_notice),
+                model_route=live.get("model_route"), model_name=live.get("model_name"),
+                created_at=live.get("created_at"), generated_at=live.get("generated_at"),
+                if_not_fresher_than=live["generated_at"] if live.get("generated_at") else None)
+            return
+        # The stable slug is the exposed, Slack-linked URL and the atomic freshness guard
+        # (if_not_fresher_than) decides whether this run wins the race against a concurrent
+        # publisher. Commit it first and use its outcome: if a newer run already committed
+        # between our read of the live page and this write, the guard skips the write and
+        # this run's snapshot is staler than what is live — so persist none of its date-keyed
+        # facts or archive and post no stale summary for it.
+        stable_committed = await upsert_published_page(
+            STABLE_SLUG, PAGE_KIND, "Frontier One — Environment Status", page,
+            model_route=model_route, model_name=model_name, created_at=now,
+            generated_at=fetched_generated, if_not_fresher_than=fetched_generated)
+        if not stable_committed:
+            live_winner = await get_published_page(STABLE_SLUG)
+            winner_when = (_as_utc(live_winner["generated_at"]).isoformat()
+                           if live_winner and live_winner.get("generated_at") else "unknown")
+            await notify_user_ephemeral(
+                channel, user,
+                f"A newer run already published the status page ({winner_when}) before this "
+                "run's write landed, so this run's snapshot was not published or stored.",
+                None, response_url)
+            return
         await upsert_status_snapshot(date_key, rows)
         # Archives are keyed by snapshot date; stamp created_at with that date so pruning
         # by created_at cannot keep a stale-snapshot archive alive for another keep-window.
         archive_created_at = datetime.strptime(date_key, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         await upsert_published_page(_archive_slug(date_key), PAGE_KIND, "Frontier One — Environment Status", page,
-                                    model_route=model_route, model_name=model_name, created_at=archive_created_at)
+                                    model_route=model_route, model_name=model_name, created_at=archive_created_at,
+                                    generated_at=fetched_generated)
         cutoff = now - timedelta(days=status_page_keep_days())
         await prune_published_pages(PAGE_KIND, cutoff, protected_slug=STABLE_SLUG)
-        # The stable slug is the exposed, Slack-linked URL, so it is committed last:
-        # an earlier failure must not leave the stable page live.
-        await upsert_published_page(STABLE_SLUG, PAGE_KIND, "Frontier One — Environment Status", page,
-                                    model_route=model_route, model_name=model_name, created_at=now)
     except Exception as e:
-        # Do not publish a page or post to Slack when the page could not be built or stored.
+        # Do not post to Slack when the page could not be built or stored. If the stable
+        # slug was already committed before a later snapshot/archive/prune step failed, the
+        # page is live, so say so instead of claiming nothing was published.
         logger.exception("status page: could not build or store the page")
-        await notify_user_ephemeral(channel, user, f"Could not finish the status page (nothing was published): {e}", None, response_url)
+        if stable_committed:
+            await notify_user_ephemeral(
+                channel, user,
+                f"The status page was published, but a follow-up step (snapshot, archive, or "
+                f"prune) failed: {e}", None, response_url)
+        else:
+            await notify_user_ephemeral(channel, user, f"Could not finish the status page (nothing was published): {e}", None, response_url)
         return
 
     url = page_url(STABLE_SLUG)

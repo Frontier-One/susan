@@ -20,7 +20,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
-from sqlalchemy import Boolean, String, Text, DateTime, Integer, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    String,
+    Text,
+    DateTime,
+    Integer,
+    inspect,
+    text,
+    UniqueConstraint,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -179,8 +188,47 @@ class RepoPickPending(Base):
 
 
 async def init_db() -> None:
+    raced = False
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # create_all makes missing tables but does not ALTER existing ones, so a
+        # deployed published_pages that predates generated_at gains it here.
+        columns = {c["name"] for c in await conn.run_sync(
+            lambda sync_conn: inspect(sync_conn).get_columns("published_pages")
+        )}
+        if "generated_at" not in columns:
+            ddl = {"postgresql": "TIMESTAMPTZ"}.get(
+                engine.dialect.name, "DATETIME"
+            )
+            try:
+                await conn.execute(
+                    text(f"ALTER TABLE published_pages ADD COLUMN generated_at {ddl}")
+                )
+            except Exception:
+                # Concurrent starters can both observe the column absent and both
+                # ALTER; the second loses on a duplicate-column error, which
+                # aborts its transaction. Roll back and let another starter's
+                # column stand, then verify below on a fresh connection.
+                await conn.rollback()
+                raced = True
+    if raced and "generated_at" not in await _published_pages_has_column():
+        raise ValueError(
+            "published_pages.generated_at is still missing after the startup migration"
+        )
+
+
+async def _published_pages_has_column() -> bool:
+    """True when ``published_pages`` already carries the ``generated_at`` column.
+
+    Read on its own connection so it is not blocked by, or tangled with, the
+    startup transaction that just lost the ALTER race.
+    """
+    async with engine.connect() as conn:
+        return "generated_at" in {
+            c["name"] for c in await conn.run_sync(
+                lambda sync_conn: inspect(sync_conn).get_columns("published_pages")
+            )
+        }
 
 
 async def create_repo_pick_pending(
@@ -396,6 +444,9 @@ class PublishedPage(Base):
     model_route: Mapped[str | None] = mapped_column(String(40), nullable=True)
     model_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # The artifact's own `generated` stamp the page was built from, so a later run can
+    # refuse to replace a fresher published page with a staler snapshot.
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ScheduledJob(Base):
@@ -1237,17 +1288,39 @@ async def upsert_published_page(
     slug: str, kind: str, title: str, html: str,
     *, model_route: str | None = None, model_name: str | None = None,
     created_at: datetime | None = None,
-) -> None:
+    generated_at: datetime | None = None,
+    if_not_fresher_than: datetime | None = None,
+) -> bool:
+    """Store ``html`` as the published page for ``slug``; return True if the write committed.
+
+    When ``if_not_fresher_than`` is given, the write is made conditionally and atomically:
+    it is skipped if the row already holds a ``generated_at`` that is strictly newer
+    (fresher) than that value. This guards the stable/latest slug against a concurrent
+    publisher that committed a page built from a newer snapshot between this caller's own
+    read of the page and its write (a TOCTOU race), so a staler snapshot cannot overwrite
+    a fresher one. The read, comparison and write happen in one transaction (with a row
+    lock where the backend supports it).
+
+    Returns False when the guarded write was skipped because the stored page is already
+    fresher, so a caller can suppress side effects that would otherwise be stale. Returns
+    True when the row was created or updated.
+    """
     async with SessionLocal() as session:
-        row = await session.get(PublishedPage, slug)
+        row = await session.get(PublishedPage, slug, with_for_update=True)
+        if if_not_fresher_than is not None and row is not None and row.generated_at is not None:
+            if _as_utc_aware(row.generated_at) > _as_utc_aware(if_not_fresher_than):
+                return False
         now = created_at if created_at is not None else datetime.now(timezone.utc)
         if row is None:
             session.add(PublishedPage(slug=slug, kind=kind, title=title, html=html,
-                                      model_route=model_route, model_name=model_name, created_at=now))
+                                      model_route=model_route, model_name=model_name, created_at=now,
+                                      generated_at=generated_at))
         else:
             row.kind, row.title, row.html = kind, title, html
             row.model_route, row.model_name, row.created_at = model_route, model_name, now
+            row.generated_at = generated_at
         await session.commit()
+        return True
 
 
 async def get_published_page(slug: str) -> dict | None:
@@ -1256,7 +1329,8 @@ async def get_published_page(slug: str) -> dict | None:
         if row is None:
             return None
         return {"slug": row.slug, "kind": row.kind, "title": row.title, "html": row.html,
-                "created_at": row.created_at, "model_route": row.model_route, "model_name": row.model_name}
+                "created_at": row.created_at, "model_route": row.model_route, "model_name": row.model_name,
+                "generated_at": row.generated_at}
 
 
 async def latest_published_page(kind: str) -> dict | None:

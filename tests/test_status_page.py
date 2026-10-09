@@ -106,6 +106,80 @@ def test_render_without_narrative_says_so_and_still_carries_facts() -> None:
     assert "<b>53</b>" in html
 
 
+def test_render_surfaces_the_run_it_read_not_the_render_time() -> None:
+    """The page names the artifact it actually read: run id and completion time from the
+    fetched object, and the snapshot's own generated stamp, not the render time."""
+    html = sp.render_status_page(sp.env_facts(SNAP), None,
+                                 snapshot_when="2026-09-21T04:45:00Z", run_url="https://run",
+                                 generated_at=datetime(2026, 10, 7, 17, 0, tzinfo=timezone.utc),
+                                 model_name=None, run_id="9876543",
+                                 run_completed_at="2026-09-21T04:52:00Z")
+    assert "9876543" in html
+    assert "2026-09-21T04:52:00Z" in html
+    assert "2026-09-21T04:45:00Z" in html
+    # the render time is the Page built stamp only, never presented as the run's identity
+    assert "2026-10-07" in html
+    assert "Page built" in html
+
+
+def test_render_flags_a_stale_snapshot() -> None:
+    """A snapshot older than one nightly interval gets a banner so a reader need not
+    compare the two stamps themselves."""
+    html = sp.render_status_page(sp.env_facts(SNAP), None,
+                                 snapshot_when="2026-09-21T04:45:00Z", run_url="",
+                                 generated_at=datetime(2026, 10, 7, 17, 0, tzinfo=timezone.utc),
+                                 model_name=None)
+    assert "nights old" in html
+    assert "should not be read as fresh" in html
+
+
+def test_render_no_stale_banner_when_recent() -> None:
+    """A snapshot within the nightly interval is presented without a stale notice."""
+    html = sp.render_status_page(sp.env_facts(SNAP), None,
+                                 snapshot_when="2026-10-07T04:45:00Z", run_url="",
+                                 generated_at=datetime(2026, 10, 7, 17, 0, tzinfo=timezone.utc),
+                                 model_name=None)
+    assert "nights old" not in html
+    assert "should not be read as fresh" not in html
+
+
+def test_render_no_stale_banner_when_unparseable() -> None:
+    """A missing or unparseable generated stamp must not raise and must not invent staleness."""
+    for when in ("", "not-a-date", "x"):
+        html = sp.render_status_page(sp.env_facts(SNAP), None, snapshot_when=when, run_url="",
+                                     generated_at=datetime(2026, 10, 7, 17, 0, tzinfo=timezone.utc),
+                                     model_name=None)
+        assert "nights old" not in html
+
+
+def test_with_stale_notice_keeps_exactly_one_banner_across_repeated_refusals() -> None:
+    """A repeated refusal must not stack a second stale banner: the notice text grows nightly
+    ("Data is N nights old"), so exact-text dedup is not enough. Each insert replaces the old block,
+    leaving exactly one `.note` on the live page."""
+    base = "<html><body>LIVE CONTENT</body></html>"
+    notice_a = sp._stale_notice("2026-10-05T04:00:00Z",
+                                datetime(2026, 10, 7, 17, 0, tzinfo=timezone.utc))
+    notice_b = sp._stale_notice("2026-10-04T04:00:00Z",
+                                datetime(2026, 10, 7, 17, 0, tzinfo=timezone.utc))
+    assert notice_a != notice_b                      # the text changes night to night
+
+    once = sp._with_stale_notice(base, notice_a)
+    assert notice_a in once                          # "Data is 3 nights old."
+    assert once.count('<div class="note">') == 1
+
+    twice = sp._with_stale_notice(once, notice_b)
+    assert notice_b in twice                         # "Data is 4 nights old."
+    assert notice_a not in twice                     # the older banner was replaced, not stacked
+    assert twice.count('<div class="note">') == 1
+    assert "LIVE CONTENT" in twice
+
+
+def test_with_stale_notice_no_banner_when_empty() -> None:
+    """A fresh/unknown snapshot yields no notice, and the page is returned untouched."""
+    base = "<html><body>LIVE CONTENT</body></html>"
+    assert sp._with_stale_notice(base, "") == base
+
+
 def test_page_url_carries_the_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://susan.example/")
     monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok123")
@@ -161,6 +235,7 @@ async def test_process_builds_stores_and_posts(monkeypatch: pytest.MonkeyPatch) 
 
     async def upsert(slug, kind, title, html, **kw):
         stored[f"slug:{slug}"] = {"kind": kind, "html": html, **kw}
+        return True
 
     async def prune(kind, older_than, protected_slug=None):
         return 0
@@ -190,9 +265,15 @@ async def test_process_builds_stores_and_posts(monkeypatch: pytest.MonkeyPatch) 
     async def snap_store(key: str, payload: list) -> None:
         seen_cleared["stored"] = payload
 
+    async def none_live(slug: str):
+        return None
+
     monkeypatch.setattr(sp, "previous_status_snapshot", prev)
     monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
     monkeypatch.setattr(sp, "prune_published_pages", prune)
+    # farm/issue-39's process also reads the live page before publishing; no live page
+    # here (first publish), so the real DB must never be reached under this stub set.
+    monkeypatch.setattr(sp, "get_published_page", none_live)
 
     await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
 
@@ -246,6 +327,7 @@ async def test_process_cleared_list_is_computed_from_stored_facts(monkeypatch: p
 
     async def upsert(slug, kind, title, html, **kw):
         stored[f"slug:{slug}"] = {"kind": kind, "html": html, **kw}
+        return True
 
     async def prune(kind, older_than, protected_slug=None):
         return 0
@@ -270,9 +352,15 @@ async def test_process_cleared_list_is_computed_from_stored_facts(monkeypatch: p
     async def snap_store(key: str, payload: list) -> None:
         return None
 
+    async def none_live(slug: str):
+        return None
+
     monkeypatch.setattr(sp, "previous_status_snapshot", prev)
     monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
     monkeypatch.setattr(sp, "prune_published_pages", prune)
+    # farm/issue-39's process also reads the live page before publishing; no live page
+    # here (first publish), so the real DB must never be reached under this stub set.
+    monkeypatch.setattr(sp, "get_published_page", none_live)
 
     await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
 
@@ -409,6 +497,445 @@ async def test_stable_and_archive_publish_and_prune_through_the_real_db_layer(tm
     await dbmod.prune_published_pages("env-status", now - timedelta(days=365),
                                       protected_slug="env-status")
     assert (await dbmod.get_published_page("weekly/foo")) is not None
+
+
+def test_refuses_stale_publish() -> None:
+    newer = datetime(2026, 10, 6, 4, 0, tzinfo=timezone.utc)
+    older = datetime(2026, 9, 14, 4, 0, tzinfo=timezone.utc)
+    assert sp.refuses_stale_publish(older, newer) is True      # fetched strictly older
+    assert sp.refuses_stale_publish(newer, older) is False     # fetched newer
+    assert sp.refuses_stale_publish(newer, newer) is False     # fetched equal
+    assert sp.refuses_stale_publish(None, newer) is False      # no fetched evidence
+    assert sp.refuses_stale_publish(older, None) is False      # no published evidence
+    assert sp.refuses_stale_publish(None, None) is False
+
+
+def test_refuses_stale_publish_tolerates_a_naive_published_stamp() -> None:
+    """A SQLite-held DB reads generated_at back naive; the comparator must not raise on
+    the mixed naive/aware pair and must still judge UTC equality."""
+    fetched_older = datetime(2026, 9, 14, 4, 0, tzinfo=timezone.utc)
+    fetched_newer = datetime(2026, 10, 6, 4, 0, tzinfo=timezone.utc)
+    published_naive_newer = datetime(2026, 10, 6, 4, 0)        # naive, read back as UTC
+    published_naive_older = datetime(2026, 9, 14, 4, 0)        # naive, read back as UTC
+    # fetched older than the naive published stamp → refuse
+    assert sp.refuses_stale_publish(fetched_older, published_naive_newer) is True
+    # fetched newer than the naive published stamp → do not refuse
+    assert sp.refuses_stale_publish(fetched_newer, published_naive_older) is False
+    # fetched equal to the naive published stamp → do not refuse
+    assert sp.refuses_stale_publish(fetched_older, published_naive_older) is False
+
+
+@pytest.mark.asyncio
+async def test_process_refuses_to_replace_a_fresher_page_with_a_staler_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run whose snapshot predates the live page's generated stamp must not publish the
+    staler snapshot or its facts, but must persist the AC3 stale notice on the still-live page."""
+    from app.claude_client import ModelCompletion
+
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://susan.example")
+
+    stale_snap = dict(SNAP, generated="2026-09-14T04:45:00Z")
+
+    async def token(user: str) -> str:
+        return "gh"
+
+    async def snap(tok: str) -> dict:
+        return {"status_json": stale_snap, "status_html": "", "run_url": "https://run",
+                "run_created_at": "2026-09-14T04:40:00Z"}
+
+    async def ctx(user: str, tok: str) -> tuple[str, str]:
+        return "alerts…", "- cloud-infra#1563"
+
+    async def completion(system, user_prompt, **kw) -> ModelCompletion:
+        return ModelCompletion(json.dumps({"standfirst": "s", "environments": {}, "blockers": [], "cleared": [], "watch": []}),
+                               model_route="sovereign", model_name="glm-5.3-flash")
+
+    live = {"slug": "env-status", "kind": "env-status", "title": "T", "html": "<html>LIVE</html>",
+            "created_at": None, "generated_at": datetime(2026, 10, 6, 4, 0, tzinfo=timezone.utc)}
+
+    async def live_page(slug: str):
+        return live
+
+    published: dict[str, dict] = {}
+    snap_stored: list[str] = []
+
+    async def upsert(slug, kind, title, html, **kw):
+        published[slug] = {"html": html, **kw}
+
+    async def snap_store(key: str, payload: list) -> None:
+        snap_stored.append(key)
+
+    async def prune(kind, older_than, protected_slug=None):
+        return 0
+
+    async def prev(before_key: str):
+        return None
+
+    notified: dict[str, str] = {}
+
+    async def notify(channel, user, text, blocks=None, response_url=None, **kw):
+        notified["text"] = text
+
+    async def post(channel, text, **kw):
+        return None
+
+    monkeypatch.setattr(sp, "get_github_token", token)
+    monkeypatch.setattr(sp, "fetch_latest_status_snapshot", snap)
+    monkeypatch.setattr(sp, "gather_context", ctx)
+    monkeypatch.setattr(sp, "call_claude", completion)
+    monkeypatch.setattr(sp, "get_published_page", live_page)
+    monkeypatch.setattr(sp, "upsert_published_page", upsert)
+    monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
+    monkeypatch.setattr(sp, "prune_published_pages", prune)
+    monkeypatch.setattr(sp, "previous_status_snapshot", prev)
+    monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
+    monkeypatch.setattr(sp, "post_message", post)
+
+    # Pin the clock: the persisted notice is computed from the live page's generated_at vs
+    # `now`, so a fixed `now` (just over a day after the live page) makes the banner's
+    # presence deterministic regardless of when the test runs.
+    await sp.process_status_page("status page --no-approval", "C1", "U1", None, None,
+                                 now=datetime(2026, 10, 7, 17, 0, tzinfo=timezone.utc))
+
+    # Only the stable slug is re-written, to carry the stale notice; the staler snapshot's
+    # facts are not published as an archive, not stored as a snapshot,
+    # and the live page's own generated stamp is preserved.
+    assert list(published) == ["env-status"]
+    assert snap_stored == []                      # no snapshot persisted
+    stable = published["env-status"]
+    # The persisted notice conveys the live page's own data age vs. now (its generated_at
+    # is Oct 6, a day or two old), not the ~3-week gap to the rejected snapshot.
+    assert "nights old" in stable["html"]
+    assert stable["html"].startswith("<html>LIVE</html>") or "LIVE" in stable["html"]
+    assert stable["generated_at"] == live["generated_at"]   # fresher facts untouched
+    assert "older" in notified["text"]
+    assert "nothing was replaced" in notified["text"]
+
+
+@pytest.mark.asyncio
+async def test_process_refuses_with_a_naive_live_generated_stamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A SQLite-held DB returns generated_at naive; the refusal path must read it as UTC,
+    refuse a staler fetch, and not raise on the mixed naive/aware comparison."""
+    from app.claude_client import ModelCompletion
+
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://susan.example")
+
+    stale_snap = dict(SNAP, generated="2026-09-14T04:45:00Z")
+
+    async def token(user: str) -> str:
+        return "gh"
+
+    async def snap(tok: str) -> dict:
+        return {"status_json": stale_snap, "status_html": "", "run_url": "https://run",
+                "run_created_at": "2026-09-14T04:40:00Z"}
+
+    async def ctx(user: str, tok: str) -> tuple[str, str]:
+        return "alerts…", "- cloud-infra#1563"
+
+    async def completion(system, user_prompt, **kw) -> ModelCompletion:
+        return ModelCompletion(json.dumps({"standfirst": "s", "environments": {}, "blockers": [], "cleared": [], "watch": []}),
+                               model_route="sovereign", model_name="glm-5.3-flash")
+
+    async def live_page(slug: str):
+        return {"slug": slug, "kind": "env-status", "title": "T", "html": "<html>LIVE</html>",
+                "created_at": None, "generated_at": datetime(2026, 10, 6, 4, 0)}
+
+    published: dict[str, dict] = {}
+    snap_stored: list[str] = []
+
+    async def upsert(slug, kind, title, html, **kw):
+        published[slug] = {"html": html, **kw}
+
+    async def snap_store(key: str, payload: list) -> None:
+        snap_stored.append(key)
+
+    async def prune(kind, older_than, protected_slug=None):
+        return 0
+
+    async def prev(before_key: str):
+        return None
+
+    notified: dict[str, str] = {}
+
+    async def notify(channel, user, text, blocks=None, response_url=None, **kw):
+        notified["text"] = text
+
+    async def post(channel, text, **kw):
+        return None
+
+    monkeypatch.setattr(sp, "get_github_token", token)
+    monkeypatch.setattr(sp, "fetch_latest_status_snapshot", snap)
+    monkeypatch.setattr(sp, "gather_context", ctx)
+    monkeypatch.setattr(sp, "call_claude", completion)
+    monkeypatch.setattr(sp, "get_published_page", live_page)
+    monkeypatch.setattr(sp, "upsert_published_page", upsert)
+    monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
+    monkeypatch.setattr(sp, "prune_published_pages", prune)
+    monkeypatch.setattr(sp, "previous_status_snapshot", prev)
+    monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
+    monkeypatch.setattr(sp, "post_message", post)
+
+    await sp.process_status_page("status page --no-approval", "C2", "U2", None, None,
+                                 now=datetime(2026, 10, 7, 17, 0, tzinfo=timezone.utc))
+
+    assert list(published) == ["env-status"]      # only stable, to carry the stale notice
+    assert snap_stored == []                      # no snapshot persisted either
+    assert "nights old" in published["env-status"]["html"]
+    assert "older" in notified["text"]
+    assert "nothing was replaced" in notified["text"]
+
+
+@pytest.mark.asyncio
+async def test_process_publishes_fresh_snapshot_even_when_an_older_page_is_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A snapshot newer than the live page's generated stamp publishes normally, carrying
+    the fetched generated through to both stable and archive pages."""
+    from app.claude_client import ModelCompletion
+
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://susan.example")
+
+    fresh_snap = dict(SNAP, generated="2026-09-26T04:45:00Z")
+
+    async def token(user: str) -> str:
+        return "gh"
+
+    async def snap(tok: str) -> dict:
+        return {"status_json": fresh_snap, "status_html": "", "run_url": "https://run",
+                "run_created_at": "2026-09-26T04:40:00Z", "run_id": "11", "run_completed_at": "2026-09-26T04:52:00Z"}
+
+    async def ctx(user: str, tok: str) -> tuple[str, str]:
+        return "alerts…", "- cloud-infra#1563"
+
+    async def completion(system, user_prompt, **kw) -> ModelCompletion:
+        return ModelCompletion(json.dumps({"standfirst": "s", "environments": {}, "blockers": [], "cleared": [], "watch": []}),
+                               model_route="sovereign", model_name="glm-5.3-flash")
+
+    async def live_page(slug: str):
+        return {"slug": slug, "kind": "env-status", "title": "T", "html": "<html>OLD</html>",
+                "created_at": None, "generated_at": datetime(2026, 9, 20, 4, 0, tzinfo=timezone.utc)}
+
+    published: dict[str, object] = {}
+
+    async def upsert(slug, kind, title, html, **kw):
+        published[slug] = kw
+        return True
+
+    async def snap_store(key: str, payload: list) -> None:
+        return None
+
+    async def prune(kind, older_than, protected_slug=None):
+        return 0
+
+    async def prev(before_key: str):
+        return None
+
+    async def notify(*a, **k):
+        return None
+
+    async def post(channel, text, **kw):
+        return None
+
+    monkeypatch.setattr(sp, "get_github_token", token)
+    monkeypatch.setattr(sp, "fetch_latest_status_snapshot", snap)
+    monkeypatch.setattr(sp, "gather_context", ctx)
+    monkeypatch.setattr(sp, "call_claude", completion)
+    monkeypatch.setattr(sp, "get_published_page", live_page)
+    monkeypatch.setattr(sp, "upsert_published_page", upsert)
+    monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
+    monkeypatch.setattr(sp, "prune_published_pages", prune)
+    monkeypatch.setattr(sp, "previous_status_snapshot", prev)
+    monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
+    monkeypatch.setattr(sp, "post_message", post)
+
+    await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
+
+    assert "env-status" in published and "env-status-2026-09-26" in published
+    expected_generated = sp._parse_generated("2026-09-26T04:45:00Z")
+    for slug in ("env-status", "env-status-2026-09-26"):
+        assert published[slug]["generated_at"] == expected_generated
+
+
+@pytest.mark.asyncio
+async def test_process_stores_the_fetched_run_identity_in_the_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stored page carries the run id and completion time from the fetched snapshot, not 'unknown'."""
+    from app.claude_client import ModelCompletion
+
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://susan.example")
+
+    fresh_snap = dict(SNAP, generated="2026-09-26T04:45:00Z")
+
+    async def token(user: str) -> str:
+        return "gh"
+
+    async def snap(tok: str) -> dict:
+        return {"status_json": fresh_snap, "status_html": "", "run_url": "https://run",
+                "run_created_at": "2026-09-26T04:40:00Z", "run_id": "11", "run_completed_at": "2026-09-26T04:52:00Z"}
+
+    async def ctx(user: str, tok: str) -> tuple[str, str]:
+        return "alerts…", "- cloud-infra#1563"
+
+    async def completion(system, user_prompt, **kw) -> ModelCompletion:
+        return ModelCompletion(json.dumps({"standfirst": "s", "environments": {}, "blockers": [], "cleared": [], "watch": []}),
+                               model_route="sovereign", model_name="glm-5.3-flash")
+
+    async def live_page(slug: str):
+        return {"slug": slug, "kind": "env-status", "title": "T", "html": "<html>OLD</html>",
+                "created_at": None, "generated_at": datetime(2026, 9, 20, 4, 0, tzinfo=timezone.utc)}
+
+    stored_pages: dict[str, str] = {}
+
+    async def upsert(slug, kind, title, html, **kw):
+        stored_pages[slug] = html
+        return True
+
+    async def snap_store(key: str, payload: list) -> None:
+        return None
+
+    async def prune(kind, older_than, protected_slug=None):
+        return 0
+
+    async def prev(before_key: str):
+        return None
+
+    async def notify(*a, **k):
+        return None
+
+    async def post(channel, text, **kw):
+        return None
+
+    monkeypatch.setattr(sp, "get_github_token", token)
+    monkeypatch.setattr(sp, "fetch_latest_status_snapshot", snap)
+    monkeypatch.setattr(sp, "gather_context", ctx)
+    monkeypatch.setattr(sp, "call_claude", completion)
+    monkeypatch.setattr(sp, "get_published_page", live_page)
+    monkeypatch.setattr(sp, "upsert_published_page", upsert)
+    monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
+    monkeypatch.setattr(sp, "prune_published_pages", prune)
+    monkeypatch.setattr(sp, "previous_status_snapshot", prev)
+    monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
+    monkeypatch.setattr(sp, "post_message", post)
+
+    await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
+
+    assert "env-status" in stored_pages and "env-status-2026-09-26" in stored_pages
+    for html in stored_pages.values():
+        # the fetched run identity, not the placeholder, names the artifact being rendered
+        assert "11" in html
+        assert "2026-09-26T04:52:00Z" in html
+
+
+@pytest.mark.asyncio
+async def test_init_db_migrates_generated_at_onto_a_pre_column_published_pages(tmp_path, monkeypatch) -> None:
+    """A deployed published_pages that predates generated_at is upgraded by init_db."""
+    import sys
+
+    from sqlalchemy import text as _text
+
+    monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "t.db"))
+    sys.modules.pop("db", None)
+    import db as dbmod
+
+    # hand-build the pre-column table exactly as create_all would have made it, then
+    # populate a row the deployed page would have left behind
+    async with dbmod.engine.begin() as conn:
+        await conn.execute(_text(
+            "CREATE TABLE published_pages ("
+            "slug VARCHAR(120) NOT NULL, "
+            "kind VARCHAR(40) NOT NULL, "
+            "title VARCHAR(200) NOT NULL, "
+            "html TEXT NOT NULL, "
+            "model_route VARCHAR(40), "
+            "model_name VARCHAR(120), "
+            "created_at DATETIME NOT NULL, "
+            "PRIMARY KEY (slug))"
+        ))
+        await conn.execute(_text(
+            "INSERT INTO published_pages "
+            "(slug, kind, title, html, model_route, model_name, created_at) "
+            "VALUES ('env-1', 'env-status', 'T', '<html>OLD</html>', "
+            "'sovereign', 'glm-5.3-flash', '2026-09-24 04:45:00')"
+        ))
+
+    # the migration path adds generated_at without disturbing the existing row
+    await dbmod.init_db()
+
+    got = await dbmod.get_published_page("env-1")
+    assert got["html"] == "<html>OLD</html>"
+    assert got["generated_at"] is None
+
+    # generated_at reads and writes against the upgraded table
+    g = datetime(2026, 9, 24, 4, 45, tzinfo=timezone.utc)
+    await dbmod.upsert_published_page("env-1", "env-status", "T", "<html>NEW</html>", generated_at=g)
+    got2 = await dbmod.get_published_page("env-1")
+    stored = got2["generated_at"]
+    if stored.tzinfo is None:
+        stored = stored.replace(tzinfo=timezone.utc)   # SQLite reads back naive
+    assert stored == g
+
+    # idempotent: a second init_db (column already present) does not raise
+    await dbmod.init_db()
+
+
+@pytest.mark.asyncio
+async def test_published_page_generated_at_round_trips_through_the_real_db_layer(tmp_path, monkeypatch) -> None:
+    """A page's source `generated` stamp persists through insert and the overwrite update."""
+    import sys
+
+    monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "t.db"))
+    sys.modules.pop("db", None)
+    import db as dbmod
+
+    await dbmod.init_db()
+    g = datetime(2026, 9, 24, 4, 45, tzinfo=timezone.utc)
+    await dbmod.upsert_published_page("env-1", "env-status", "T", "<html>A</html>", generated_at=g)
+    got = await dbmod.get_published_page("env-1")
+    stored = got["generated_at"]
+    if stored.tzinfo is None:
+        stored = stored.replace(tzinfo=timezone.utc)   # SQLite reads back naive
+    assert stored == g
+
+    g2 = datetime(2026, 9, 25, 4, 45, tzinfo=timezone.utc)
+    await dbmod.upsert_published_page("env-1", "env-status", "T", "<html>B</html>", generated_at=g2)
+    got2 = await dbmod.get_published_page("env-1")
+    stored2 = got2["generated_at"]
+    if stored2.tzinfo is None:
+        stored2 = stored2.replace(tzinfo=timezone.utc)
+    assert stored2 == g2
+
+
+@pytest.mark.asyncio
+async def test_upsert_published_page_if_not_fresher_than_refuses_to_overwrite_a_fresher_page(tmp_path, monkeypatch) -> None:
+    """The atomically-guarded stable write skips when the stored page is already fresher:
+    an older snapshot cannot clobber a newer page even if the caller read stale state."""
+    import sys
+
+    monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "t.db"))
+    sys.modules.pop("db", None)
+    import db as dbmod
+
+    await dbmod.init_db()
+
+    older = datetime(2026, 9, 24, 4, 45, tzinfo=timezone.utc)
+    newer = datetime(2026, 9, 26, 4, 45, tzinfo=timezone.utc)
+    await dbmod.upsert_published_page("env-status", "env-status", "T", "<html>FRESH</html>", generated_at=newer)
+
+    # A staler snapshot that landed after the fresher page must not replace it.
+    await dbmod.upsert_published_page("env-status", "env-status", "T", "<html>STALE</html>",
+                                      generated_at=older, if_not_fresher_than=older)
+    got = await dbmod.get_published_page("env-status")
+    assert got["html"] == "<html>FRESH</html>"
+    stored = got["generated_at"]
+    if stored.tzinfo is None:
+        stored = stored.replace(tzinfo=timezone.utc)
+    assert stored == newer
+
+    # A genuinely fresher snapshot still publishes over the older page.
+    await dbmod.upsert_published_page("env-status", "env-status", "T", "<html>NEWER</html>",
+                                      generated_at=newer, if_not_fresher_than=newer)
+    got = await dbmod.get_published_page("env-status")
+    assert got["html"] == "<html>NEWER</html>"
 
 
 # ── narrative extraction, hardened 2026-09-25 ─────────────────────────────────────────
@@ -593,6 +1120,119 @@ async def test_previous_status_snapshot_rejects_non_list_of_dicts(tmp_path, monk
     assert await dbmod.previous_status_snapshot("2026-09-24") is None
 
 
+@pytest.mark.asyncio
+async def test_status_stable_slug_serves_overwrite_in_place_latest(tmp_path, monkeypatch) -> None:
+    """The stable env-status URL serves the stable slug's own latest content, overwritten
+    in place each run, never a dated archive; /status/latest resolves to the newest
+    env-status row. Drives the real route and the real DB layer."""
+    import sys
+
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "t.db"))
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok")
+    sys.modules.pop("db", None)
+    import db as dbmod
+
+    from app.routes import app
+
+    await dbmod.init_db()
+    # a first run writes the stable slug, an older run wrote the dated archive, and the
+    # latest run overwrites the stable slug in place without duplicating it.
+    await dbmod.upsert_published_page("env-status", "env-status", "T", "<html>FIRST</html>")
+    await dbmod.upsert_published_page("env-status-2026-09-24", "env-status", "T", "<html>ARCHIVE</html>",
+                                      created_at=datetime(2026, 9, 24, 17, 0, tzinfo=timezone.utc))
+    await dbmod.upsert_published_page("env-status", "env-status", "T", "<html>SECOND</html>")
+
+    c = TestClient(app)
+    r = c.get("/status/env-status?k=tok")
+    assert r.status_code == 200
+    assert r.text == "<html>SECOND</html>"                       # overwritten in place, not stale
+    rl = c.get("/status/latest?k=tok")
+    assert rl.status_code == 200
+    assert rl.text == "<html>SECOND</html>"                      # newest env-status row
+    # the dated archive is reachable by its own slug but is NOT what the stable URL serves
+    assert c.get("/status/env-status-2026-09-24?k=tok").text == "<html>ARCHIVE</html>"
+
+
+@pytest.mark.asyncio
+async def test_fetch_latest_status_snapshot_reads_the_selected_runs_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fetched snapshot's run id, status.json and status.html all come from the run
+    that was selected, not from the first artifact or a different run's artifact."""
+    runs_url = "https://api.github.com/repos/Frontier-One/cloud-infra/actions/workflows/env-nightly.yml/runs"
+    run_b_artifacts_url = "https://api.github.com/repos/Frontier-One/cloud-infra/actions/runs/42/artifacts"
+    run_b_zip_url = "https://api.github.com/repos/Frontier-One/cloud-infra/actions/artifacts/7/zip"
+
+    run_b_json = {
+        "generated": "2026-09-24T04:45:00Z",
+        "environments": {
+            "freya": {"apps": {"synced_healthy": 16, "drifted": 0, "progressing": 0, "degraded": 0, "missing": 0},
+                      "clusters": {"control": "up", "asgard-cluster": "up"}},
+        },
+    }
+    run_b_zip = _zip({"status.json": json.dumps(run_b_json), "status.html": "<html>RUN_B</html>"})
+
+    class _FakeResponse:
+        def __init__(self, payload: object) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> object:
+            return self._payload
+
+        @property
+        def content(self) -> object:
+            return self._payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+    def resolve(url: str, params: object) -> _FakeResponse:
+        if url == runs_url:
+            return _FakeResponse({
+                "workflow_runs": [{
+                    "id": "RUN_B",
+                    "html_url": "https://github.com/Frontier-One/cloud-infra/actions/runs/42",
+                    "created_at": "2026-09-24T04:40:00Z",
+                    "updated_at": "2026-09-24T04:52:00Z",
+                    "artifacts_url": run_b_artifacts_url,
+                }],
+            })
+        if url == run_b_artifacts_url:
+            # an unrelated artifact is listed first; a buggy "first artifact" pick would
+            # grab it, but the code filters by the artifact name.
+            return _FakeResponse({
+                "artifacts": [
+                    {"name": "debug-bundle", "expired": False, "archive_download_url": "https://example/debug.zip"},
+                    {"name": "environment-status-page", "expired": False, "archive_download_url": run_b_zip_url},
+                ],
+            })
+        if url == run_b_zip_url:
+            return _FakeResponse(run_b_zip)
+        raise AssertionError(f"unexpected URL {url}")
+
+    class _FakeClient:
+        def __init__(self, resolver) -> None:
+            self._resolver = resolver
+
+        async def __aenter__(self) -> "_FakeClient":
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def get(self, url: str, headers: object = None, params: object = None) -> _FakeResponse:
+            return self._resolver(url, params)
+
+    monkeypatch.setattr(sp.httpx, "AsyncClient", lambda **kw: _FakeClient(resolve))
+
+    snap = await sp.fetch_latest_status_snapshot("gh")
+    assert snap["run_id"] == "RUN_B"                          # the selected run, not any other
+    assert snap["run_url"] == "https://github.com/Frontier-One/cloud-infra/actions/runs/42"
+    assert snap["run_created_at"] == "2026-09-24T04:40:00Z"
+    assert snap["run_completed_at"] == "2026-09-24T04:52:00Z"
+    assert snap["status_json"] == run_b_json                  # content of the selected run's artifact
+    assert snap["status_html"] == "<html>RUN_B</html>"
 # ── hardening 2026-09-25: failure phase and ordering ───────────────────────────────────
 
 
@@ -622,13 +1262,19 @@ async def test_process_failure_publishes_nothing_and_notifies(monkeypatch: pytes
     async def prev(before_key: str):
         return None
 
-    async def fail_store(key: str, payload: list) -> None:
-        raise RuntimeError("storage down")
+    async def snap_store(key: str, payload: list) -> None:
+        return None
 
     published: list[str] = []
 
-    async def upsert(slug, *a, **k):
-        published.append(slug)
+    upsert_called: list[str] = []
+
+    async def fail_upsert(slug, *a, **k):
+        upsert_called.append(slug)
+        raise RuntimeError("storage down")
+
+    async def none_live(slug: str):
+        return None
 
     async def prune(*a, **k):
         return 0
@@ -647,23 +1293,97 @@ async def test_process_failure_publishes_nothing_and_notifies(monkeypatch: pytes
     monkeypatch.setattr(sp, "fetch_latest_status_snapshot", snap)
     monkeypatch.setattr(sp, "gather_context", ctx)
     monkeypatch.setattr(sp, "call_claude", completion)
-    monkeypatch.setattr(sp, "upsert_published_page", upsert)
+    monkeypatch.setattr(sp, "upsert_published_page", fail_upsert)
+    monkeypatch.setattr(sp, "get_published_page", none_live)
     monkeypatch.setattr(sp, "post_message", post)
     monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
     monkeypatch.setattr(sp, "previous_status_snapshot", prev)
-    monkeypatch.setattr(sp, "upsert_status_snapshot", fail_store)
+    monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
     monkeypatch.setattr(sp, "prune_published_pages", prune)
 
     await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
 
+    assert upsert_called == [sp.STABLE_SLUG]        # the injected page-write failure ran
     assert "called" not in posts                 # nothing posted to Slack
     assert published == []                        # stable slug never committed
     assert notified and "nothing was published" in notified[0]
 
 
 @pytest.mark.asyncio
+async def test_process_reports_late_failure_when_stable_committed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the stable slug is committed but a later step (snapshot/archive/prune) fails,
+    the user is told the page was published and which follow-up step failed, not that nothing
+    was published."""
+    from app.claude_client import ModelCompletion
+
+    monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://susan.example")
+
+    async def token(user: str) -> str:
+        return "gh"
+
+    async def snap(tok: str) -> dict:
+        return {"status_json": SNAP, "status_html": "", "run_url": "https://run", "run_created_at": "2026-09-24T04:40:00Z"}
+
+    async def ctx(user: str, tok: str) -> tuple[str, str]:
+        return "", ""
+
+    async def completion(system, user_prompt, **kw) -> ModelCompletion:
+        return ModelCompletion(json.dumps({"standfirst": "One sentence.", "environments": {}, "blockers": [], "cleared": [], "watch": []}),
+            model_route="sovereign", model_name="glm-5.3-flash")
+
+    async def prev(before_key: str):
+        return None
+
+    async def fail_snap_store(key: str, payload: list) -> None:
+        raise RuntimeError("snapshot storage down")
+
+    async def none_live(slug: str):
+        return None
+
+    published: list[str] = []
+
+    async def commit_upsert(slug, *a, **k):
+        published.append(slug)
+        return True
+
+    async def prune(*a, **k):
+        return 0
+
+    posts: dict[str, object] = {}
+
+    async def post(channel, text, **kw):
+        posts["called"] = True
+
+    notified: list[str] = []
+
+    async def notify(channel, user, text, blocks=None, response_url=None, **kw):
+        notified.append(text)
+
+    monkeypatch.setattr(sp, "get_github_token", token)
+    monkeypatch.setattr(sp, "get_published_page", none_live)
+    monkeypatch.setattr(sp, "fetch_latest_status_snapshot", snap)
+    monkeypatch.setattr(sp, "gather_context", ctx)
+    monkeypatch.setattr(sp, "call_claude", completion)
+    monkeypatch.setattr(sp, "upsert_published_page", commit_upsert)
+    monkeypatch.setattr(sp, "post_message", post)
+    monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
+    monkeypatch.setattr(sp, "previous_status_snapshot", prev)
+    monkeypatch.setattr(sp, "upsert_status_snapshot", fail_snap_store)
+    monkeypatch.setattr(sp, "prune_published_pages", prune)
+
+    await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
+
+    assert sp.STABLE_SLUG in published              # stable slug was committed
+    assert "called" not in posts                     # nothing posted to Slack
+    assert notified and "was published" in notified[0]
+    assert "nothing was published" not in notified[0]
+
+
+@pytest.mark.asyncio
 async def test_process_orders_stable_slug_after_archive(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The stable slug is committed last: an earlier failure cannot leave it live."""
+    """The guarded stable write runs before the date-keyed archive: if it loses the race to a
+    newer run, no stale archive or facts are persisted (and no stale summary is posted)."""
     from app.claude_client import ModelCompletion
 
     monkeypatch.setenv("SUSAN_STATUS_PAGE_TOKEN", "tok")
@@ -695,6 +1415,7 @@ async def test_process_orders_stable_slug_after_archive(monkeypatch: pytest.Monk
 
     async def upsert(slug, kind, title, html, **kw):
         upsert_order.append(slug)
+        return True
 
     async def notify(*a, **k):
         return None
@@ -706,13 +1427,19 @@ async def test_process_orders_stable_slug_after_archive(monkeypatch: pytest.Monk
     monkeypatch.setattr(sp, "upsert_published_page", upsert)
     monkeypatch.setattr(sp, "post_message", notify)
     monkeypatch.setattr(sp, "notify_user_ephemeral", notify)
+    async def none_live(slug: str):
+        return None
+
     monkeypatch.setattr(sp, "previous_status_snapshot", prev)
     monkeypatch.setattr(sp, "upsert_status_snapshot", snap_store)
     monkeypatch.setattr(sp, "prune_published_pages", prune)
+    # farm/issue-39's process also reads the live page before publishing; no live page
+    # here (first publish), so the real DB must never be reached under this stub set.
+    monkeypatch.setattr(sp, "get_published_page", none_live)
 
     await sp.process_status_page("status page --no-approval", "C1", "U1", None, None)
 
-    assert upsert_order == ["env-status-2026-09-24", "env-status"]
+    assert upsert_order == ["env-status", "env-status-2026-09-24"]
 
 
 @pytest.mark.asyncio
